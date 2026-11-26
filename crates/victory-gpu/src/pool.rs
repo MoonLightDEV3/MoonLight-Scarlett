@@ -70,7 +70,15 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
 
 fn spares(memory: Option<[u64; 4]>, keep: bool) -> usize {
     match memory {
-        Some([budget, used, ..]) if keep && u128::from(used) * 100 < u128::from(budget) * 85 => SPARE_KEPT,
+        Some([budget, used, ..]) if keep => {
+            let limit = (u128::from(budget) * 85 / 100) as u64;
+            if used >= limit {
+                SPARE
+            } else {
+                let half_headroom = ((limit - used) / 2 / BLOCK) as usize;
+                half_headroom.clamp(SPARE, SPARE_KEPT)
+            }
+        }
         _ => SPARE,
     }
 }
@@ -784,7 +792,10 @@ mod tests {
 
     #[test]
     fn empty_blocks_stay_while_the_card_has_room() {
-        assert_eq!(spares(Some([100, 84, 0, 0]), true), SPARE_KEPT);
+        const GB: u64 = 1 << 30;
+        assert_eq!(spares(Some([16 * GB, 2 * GB, 0, 0]), true), SPARE_KEPT);
+        assert_eq!(spares(Some([8 * GB, 5 * GB, 0, 0]), true), 14);
+        assert_eq!(spares(Some([100, 84, 0, 0]), true), SPARE);
         assert_eq!(spares(Some([100, 85, 0, 0]), true), SPARE);
         assert_eq!(spares(Some([100, 10, 0, 0]), false), SPARE);
         assert_eq!(spares(None, true), SPARE);

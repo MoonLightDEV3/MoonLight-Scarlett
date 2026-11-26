@@ -54,9 +54,16 @@ fn parts_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PAGE_PARTS").is_none_or(|v| v != "0"))
 }
 
+/// Granularity shift (16 MiB = 256 × 64 KiB pages) for [`Shard::coarse`].
+const COARSE_SHIFT: usize = 24;
+
 impl Shard {
     const fn new() -> Shard {
-        Shard { written: BTreeMap::new(), parts: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()) }
+        Shard {
+            written: BTreeMap::new(),
+            coarse: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
+            parts: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
+        }
     }
 
     /// Page `page` was found written by asking `now`: the parts in `parts`
@@ -69,6 +76,8 @@ impl Shard {
     fn note(&mut self, page: usize, parts: u16, now: u64) -> u64 {
         let before = self.written.get(&page).copied().unwrap_or(0);
         self.written.insert(page, before.max(now));
+        let bucket = (page * PAGE) >> COARSE_SHIFT;
+        self.coarse.entry(bucket).and_modify(|m| *m = (*m).max(now)).or_insert(now);
         if parts == WHOLE || !parts_on() {
             if now >= before {
                 self.parts.remove(&page);
@@ -133,6 +142,9 @@ struct Notes([RwLock<Shard>; SHARDS]);
 struct Shard {
     /// Page number → the asking that last found it written.
     written: BTreeMap<usize, u64>,
+    /// 16 MiB bucket (`(page * PAGE) >> COARSE_SHIFT`) → highest asking that
+    /// found any page in the bucket written. Allows O(1) whole-span checks.
+    coarse: std::collections::HashMap<usize, u64, std::hash::BuildHasherDefault<PageHash>>,
     /// The same for each of a page's sixteen parts ([`KERNEL_PAGE`]), where
     /// the parts are known ([`parts_on`]); a page that is not here was
     /// written whole, as far as anyone knows.
@@ -763,22 +775,24 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
 
 /// [`ask_ahead`]; `held`: the caller holds everything ([`Asking::hold_all`]).
 fn ask_ahead_held(ranges: &[(usize, usize)], held: bool) {
-    let mut pieces: Vec<(usize, usize)> = ranges
-        .iter()
-        // Not view memory known by its bits: the kernel would refuse the
-        // asking (and, asked together with others, theirs).
-        .filter(|r| r.0 < r.1 && !published(r.0, r.1) && !refused_as_view(r.0, r.1))
-        .map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE)))
-        .collect();
-    if pieces.len() < 2 {
-        return;
-    }
-    pieces.sort_unstable();
     // The submission's one asking stands ([`ask_once`]): what it does not
     // hold is left to `writes`.
     if journal().kept {
         return;
     }
+    let light_on = light();
+    let mut pieces: Vec<(usize, usize)> = ranges
+        .iter()
+        // Not view memory known by its bits, guarded read-only, or known non-watchable:
+        // the kernel would refuse the asking (and, asked together with others, theirs).
+        .filter(|r| r.0 < r.1 && !published(r.0, r.1) && !refused_as_view(r.0, r.1))
+        .map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE)))
+        .filter(|&(first, last)| !(light_on && PROTECTED.any(first, last)) && !UNWATCHED.any(first, last))
+        .collect();
+    if pieces.len() < 2 {
+        return;
+    }
+    pieces.sort_unstable();
     let _all = (!held).then(Asking::hold_all);
     let (mut asked, mut written) = (Vec::new(), Vec::new());
     let mut runs = Vec::new();
@@ -993,6 +1007,10 @@ fn ask_early(every: std::time::Duration) {
 }
 
 /// The submission's refreshes are done: `writes` asks the kernel again.
+pub(crate) fn ask_once_kept() -> bool {
+    journal().kept
+}
+
 pub(crate) fn ask_ahead_done() {
     // Renderer port #7: nothing to change is seen shared.
     if port_journal() {
@@ -1064,6 +1082,7 @@ fn ask_rest(ranges: &[(usize, usize)], held: bool) {
     // such range asked again at each of its 70 flushes (run 76: 2,300
     // askings a frame with the switch on, as without it). They are asked
     // here, once; what is not write-watched stays with `writes`.
+    let light_on = light();
     let mut written = Vec::new();
     // Those not held by an asking ahead, each once.
     let mut alone_ranges: Vec<(usize, usize)> = Vec::new();
@@ -1074,6 +1093,9 @@ fn ask_rest(ranges: &[(usize, usize)], held: bool) {
             continue;
         }
         let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+        if (light_on && PROTECTED.any(first, last)) || UNWATCHED.any(first, last) {
+            continue;
+        }
         if !held_ahead.holds(first, last) && !alone_ranges.iter().any(|&(a, b)| a <= first && last <= b) {
             alone_ranges.push((first, last));
         }
@@ -1287,9 +1309,9 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         return Some(known);
     }
     let mut guards_asked = false;
-    // (View memory read-only by our hand: the kernel would refuse. With
-    // renderer port #6 also view memory known as such, [`VIEWS`].)
-    let protected = guarded && light() && PROTECTED.any(first, last);
+    // (View memory read-only by our hand or confirmed non-watchable: the kernel would refuse.
+    // With renderer port #6 also view memory known as such, [`VIEWS`].)
+    let protected = (guarded && light() && PROTECTED.any(first, last)) || UNWATCHED.any(first, last);
     let viewed = guarded && !protected && known_views(first, last);
     if viewed {
         port6_count(P6_NOT_ASKED, 1);
@@ -1300,6 +1322,13 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         None => {
             guards_asked = true;
             if !guarded {
+                if !refused && single_committed_non_watch(first * PAGE, last * PAGE) {
+                    let mut g = guards_timed();
+                    for b in first..last {
+                        g.foreign.insert(b);
+                    }
+                    mark_unwatched(first, last);
+                }
                 return None;
             }
             #[cfg(feature = "diagnostics")]
@@ -1312,6 +1341,16 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
                 if let Some(pages) = kernel_written(first, last) {
                     guards_asked = false;
                     written = Some(pages);
+                }
+            } else if !refused {
+                if written.is_some() {
+                    mark_unwatched(first, last);
+                } else if single_committed_non_watch(first * PAGE, last * PAGE) {
+                    let mut g = guards_timed();
+                    for b in first..last {
+                        g.foreign.insert(b);
+                    }
+                    mark_unwatched(first, last);
                 }
             }
             #[cfg(feature = "diagnostics")]
@@ -1360,29 +1399,75 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     Some(answer)
 }
 
-/// Whether nothing of `[start, end)` was written that a copy with the notes
-/// `copied` (the asking after which each page from page `base` on was taken)
-/// and `ranged` (the asking after which a range that holds this one was
-/// taken whole, or 0) does not hold, as [`writes`] would answer with nothing
-/// asked: the submission's asking covers the range, or its blocks are known
-/// by their bits. `false` if something would have to be asked.
-pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64], ranged: u64) -> bool {
-    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    // The bits first, then the journal, as in `writes`.
-    let known = published(start, end);
-    #[cfg(feature = "diagnostics")]
-    if known {
-        crate::faultbook::note(crate::faultbook::What::Known, first, last, 1);
+/// Shared read handle into [`JOURNAL`], allowing chunked `nothing_new` checks
+/// under a single lock acquisition. Caller must drop it before calling `writes`.
+pub(crate) struct JournalRead(std::sync::RwLockReadGuard<'static, Journal>);
+
+pub(crate) fn read_journal() -> JournalRead {
+    JournalRead(journal())
+}
+
+impl JournalRead {
+    pub(crate) fn nothing_new(&self, start: usize, end: usize, base: usize, copied: &[u64], ranged: u64) -> bool {
+        let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+        let known = published(start, end);
+        #[cfg(feature = "diagnostics")]
+        if known {
+            crate::faultbook::note(crate::faultbook::What::Known, first, last, 1);
+        }
+        if !known && !self.0.ahead.holds(first, last) {
+            return false;
+        }
+        let Some(taken) = first.checked_sub(base).and_then(|from| copied.get(from..last - base)) else {
+            return false;
+        };
+        if ranged == 0 && !taken.iter().all(|&at| at != 0) {
+            return false;
+        }
+        if let Some(ps) = pieces(first, last) {
+            ps.into_iter().all(|(from, to)| {
+                let s = self.0.notes.read(shard_of(from));
+                if ranged != 0 {
+                    let b0 = (from * PAGE) >> COARSE_SHIFT;
+                    let b1 = (to * PAGE).saturating_sub(1) >> COARSE_SHIFT;
+                    if b1 - b0 <= 4 && (b0..=b1).all(|b| s.coarse.get(&b).copied().unwrap_or(0) <= ranged) {
+                        return true;
+                    }
+                }
+                s.written.range(from..to).all(|(&page, &write)| write <= taken[page - first].max(ranged))
+            })
+        } else {
+            self.0.notes.each(first, last, |page, write| write <= taken[page - first].max(ranged))
+        }
     }
-    let j = journal();
-    if !known && !j.ahead.holds(first, last) {
-        return false;
+
+    pub(crate) fn nothing_new_whole(&self, start: usize, end: usize, ranged: u64) -> bool {
+        if ranged == 0 {
+            return false;
+        }
+        let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+        let known = published(start, end);
+        #[cfg(feature = "diagnostics")]
+        if known {
+            crate::faultbook::note(crate::faultbook::What::Known, first, last, 1);
+        }
+        if !known && !self.0.ahead.holds(first, last) {
+            return false;
+        }
+        if let Some(ps) = pieces(first, last) {
+            ps.into_iter().all(|(from, to)| {
+                let s = self.0.notes.read(shard_of(from));
+                let b0 = (from * PAGE) >> COARSE_SHIFT;
+                let b1 = (to * PAGE).saturating_sub(1) >> COARSE_SHIFT;
+                if b1 - b0 <= 4 && (b0..=b1).all(|b| s.coarse.get(&b).copied().unwrap_or(0) <= ranged) {
+                    return true;
+                }
+                s.written.range(from..to).all(|(&_, &write)| write <= ranged)
+            })
+        } else {
+            self.0.notes.each(first, last, |_, write| write <= ranged)
+        }
     }
-    let Some(taken) = first.checked_sub(base).and_then(|from| copied.get(from..last - base)) else {
-        return false;
-    };
-    (ranged != 0 || taken.iter().all(|&at| at != 0))
-        && j.notes.each(first, last, |page, write| write <= taken[page - first].max(ranged))
 }
 
 impl Tracked {
@@ -1849,6 +1934,42 @@ static PUBLISHED: Bits = Bits::new();
 /// lock ([`writing`]): some 700 pieces a frame are landed in memory that is
 /// no view.
 static PROTECTED: Bits = Bits::new();
+
+const _: () = assert!(PAGE == BLOCK);
+
+/// Blocks confirmed not write-watched (view memory or committed non-watch
+/// allocations): skipped ahead of `GetWriteWatch` and cleared whenever the
+/// range is remapped, unmapped, or freed.
+static UNWATCHED: Bits = Bits::new();
+
+fn mark_unwatched(first: usize, last: usize) {
+    for block in first..last {
+        UNWATCHED.set(block);
+    }
+}
+
+fn clear_unwatched(first: usize, last: usize) {
+    for block in first..last {
+        UNWATCHED.clear(block);
+    }
+}
+
+fn single_committed_non_watch(start: usize, end: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_MAPPED, MEMORY_BASIC_INFORMATION, VirtualQuery,
+    };
+    if start >= end {
+        return false;
+    }
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    let n = unsafe { VirtualQuery(start as *const _, &mut info, size_of_val(&info)) };
+    n != 0
+        && info.State == MEM_COMMIT
+        && info.Type != MEM_MAPPED
+        && (info.BaseAddress as usize).saturating_add(info.RegionSize) >= end
+}
 
 /// The blocks the title's bytes were put in beside their guards
 /// ([`put_beside`]) and that no asking has told as written since. Such a
@@ -2418,7 +2539,7 @@ impl Guards {
 
     /// A write fault opened `block`.
     fn opened(&self, block: usize) {
-        const MANY: usize = 1 << 13;
+        const MANY: usize = 1 << 16;
         let rest = rest();
         let mut opened = self.opened.lock().unwrap_or_else(|e| e.into_inner());
         if opened.len() >= MANY {
@@ -2761,6 +2882,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     for &(block, view) in &came {
         if g.absent.remove(block) && !view {
             g.foreign.insert(block);
+            UNWATCHED.set(block);
         }
     }
     // The range's blocks that are neither clean nor known to be holes. A
@@ -3623,7 +3745,7 @@ pub fn title_memory_reading_now() -> Option<Reading> {
 /// write access is given back.
 pub fn title_memory_remapped(at: usize, len: usize) {
     crate::texback::remapped(at, len);
-    open(&mut title_memory_changed(at, len), at, at.saturating_add(len));
+    open(&title_memory_changed(at, len), at, at.saturating_add(len));
 }
 
 /// The runtime is about to unmap title memory `[at, at + len)`: it is
@@ -3687,6 +3809,7 @@ pub fn title_memory_freed(at: usize, len: usize) {
     for block in foreign {
         g.foreign.remove(&block);
     }
+    clear_unwatched(first, end);
     // (Memory that is still a view is not freed by that call, which fails:
     // it must not stay read-only.)
     open(&g, at, end * BLOCK);
@@ -3735,6 +3858,7 @@ fn title_memory_changed(at: usize, len: usize) -> std::sync::RwLockWriteGuard<'s
     crate::inplace::title_memory_freeing(at, len);
     let mut g = guards();
     let range = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
+    clear_unwatched(range.start, range.end);
     let absent: Vec<usize> = g.absent.range(range.clone()).collect();
     for block in absent {
         g.absent.remove(block);
@@ -5675,6 +5799,54 @@ mod many_askers_tests {
         BITS.clear(511);
         assert!(!BITS.all(300, 700) && BITS.all(300, 511) && BITS.all(512, 700));
         assert!(!BITS.all(1 << 40, (1 << 40) + 1), "outside the address space");
+    }
+
+    #[test]
+    fn unwatched_bits_skip_and_clear_on_remap_and_free() {
+        // SAFETY: plain committed allocations (no MEM_WRITE_WATCH), freed below.
+        let p = unsafe { VirtualAlloc(std::ptr::null(), 3 * PAGE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
+        assert_ne!(p, 0);
+        let first = p / PAGE;
+        assert!(writes(p, p + 3 * PAGE, false).is_none());
+        assert!(super::UNWATCHED.all(first, first + 3));
+
+        super::title_memory_remapped(p, PAGE);
+        assert!(!super::UNWATCHED.any(first, first + 1));
+        assert!(super::UNWATCHED.all(first + 1, first + 3));
+
+        super::title_memory_unmapping(p + PAGE, PAGE);
+        assert!(!super::UNWATCHED.any(first + 1, first + 2));
+        assert!(super::UNWATCHED.any(first + 2, first + 3));
+
+        super::title_memory_freed(p + 2 * PAGE, PAGE);
+        assert!(!super::UNWATCHED.any(first + 2, first + 3));
+
+        // SAFETY: freeing the test allocation above.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn ask_ahead_noop_when_ask_once_kept() {
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        // SAFETY: write-watched allocation freed at the end of the test.
+        let p = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                4 * PAGE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(p, 0);
+        super::ask_once(&[(p, p + PAGE)]);
+        assert!(super::ask_once_kept());
+        assert_eq!(super::journal().ahead.ranges.len(), 1);
+        super::ask_ahead(&[(p, p + PAGE), (p + 2 * PAGE, p + 3 * PAGE)]);
+        assert_eq!(super::journal().ahead.ranges.len(), 1);
+        super::ask_once_end();
+        assert!(!super::ask_once_kept());
+        // SAFETY: freeing the test allocation above.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
     }
 }
 

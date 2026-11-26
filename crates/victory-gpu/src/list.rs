@@ -234,6 +234,27 @@ static IDLE: std::sync::Mutex<(Vec<Idle>, u64)> = std::sync::Mutex::new((Vec::ne
 #[cfg(windows)]
 const IDLE_MOST: (usize, u64) = (512, 256 << 20);
 
+/// Resolved `(max_lists, max_scratch_bytes)` idle pool cap, overridable via
+/// `VICTORY_LIST_POOL_MAX` on 16 GB RAM laptops to bound allocator retention.
+#[cfg(windows)]
+pub(super) fn idle_most() -> (usize, u64) {
+    static MOST: std::sync::OnceLock<(usize, u64)> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        let count = std::env::var("VICTORY_LIST_POOL_MAX")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map_or(IDLE_MOST.0, |n| n.clamp(16, 1024));
+        let bytes = if count < IDLE_MOST.0 {
+            (IDLE_MOST.1 / IDLE_MOST.0 as u64)
+                .saturating_mul(count as u64)
+                .max(32 << 20)
+        } else {
+            IDLE_MOST.1
+        };
+        (count, bytes)
+    })
+}
+
 /// Whether host lists that have run are used again (on by default;
 /// `VICTORY_LIST_POOL=0`: each is made new and thrown away, as before).
 #[cfg(windows)]
@@ -269,11 +290,12 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
     if !pools() {
         return;
     }
+    let (most_count, most_bytes) = idle_most();
     for (i, Detached { host, _uploads, _state }) in lists.into_iter().enumerate() {
         // The descriptor slots and the upload memory its commands named.
         drop(_state);
         drop(_uploads);
-        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= IDLE_MOST.0 {
+        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= most_count {
             continue;
         }
         // As the title's reset does: what the list kept for its commands
@@ -281,10 +303,30 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         host.reset();
         let bytes = host.scratch_kept();
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-        if idle.0.len() < IDLE_MOST.0 && idle.1 + bytes <= IDLE_MOST.1 {
+        if idle.0.len() < most_count && idle.1 + bytes <= most_bytes {
             idle.0.push(Idle(host, bytes));
             idle.1 += bytes;
         }
+    }
+}
+
+/// Resets and returns a single unsubmitted host list (e.g. an abandoned `thin`
+/// back list evicted past `idle_most()`) back into [`IDLE`] if capacity permits.
+#[cfg(windows)]
+pub(super) fn recycle_unused(host: crate::host::HostList) {
+    if !pools() {
+        return;
+    }
+    let (most_count, most_bytes) = idle_most();
+    if IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= most_count {
+        return;
+    }
+    host.reset();
+    let bytes = host.scratch_kept();
+    let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+    if idle.0.len() < most_count && idle.1 + bytes <= most_bytes {
+        idle.0.push(Idle(host, bytes));
+        idle.1 += bytes;
     }
 }
 
@@ -397,16 +439,10 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
             }
             continue;
         }
-        let Some(fresh) = fresh_list() else {
-            continue;
-        };
-        // A new host list is open; the title's next call on its list is a
-        // reset, which wants it closed.
-        fresh.close();
         // SAFETY: one of our lists, closed and submitted: nothing records
         // into it until the title resets it.
         let list = unsafe { &mut *this.cast_mut().cast::<List>() };
-        let Some(host) = list.host.replace(fresh) else {
+        let Some(host) = list.host.take() else {
             continue;
         };
         let earlier = std::mem::take(&mut list.earlier);
@@ -469,17 +505,11 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
             order.push(i);
             continue;
         }
-        let Some(fresh) = fresh_list() else {
-            continue;
-        };
-        // A new host list is open; the title's next call on its list is a
-        // reset, which wants it closed.
-        fresh.close();
         let list = this.cast_mut().cast::<List>();
         // SAFETY: one of our lists, closed and submitted: nothing records
         // into it until the title resets it.
         let (host, uploads, state) = unsafe {
-            let Some(host) = (*list).host.replace(fresh) else {
+            let Some(host) = (*list).host.take() else {
                 continue;
             };
             let uploads =
@@ -569,17 +599,19 @@ fn new_list(
     tracing::debug!(kind, "command list");
     #[cfg(windows)]
     if thin::on() {
-        let mut list = boxed(kind, pipeline, true);
+        let mut list = boxed(kind, pipeline, true, false);
         list.thin.begin(kind, pipeline);
         return object::hand_out(LIST, list, iid, &LIST_IIDS, out);
     }
-    object::hand_out(LIST, boxed(kind, pipeline, false), iid, &LIST_IIDS, out)
+    object::hand_out(LIST, boxed(kind, pipeline, false, true), iid, &LIST_IIDS, out)
 }
 
 /// A list; with `thin` one whose calls are written down (it has no host list).
-fn boxed(kind: u32, pipeline: This, thin: bool) -> Box<List> {
+/// `with_host` allocates/attaches a backing [`HostList`] up front (non-thin
+/// newly created open lists); thin backing lists acquire one lazily on reset.
+fn boxed(kind: u32, pipeline: This, thin: bool, with_host: bool) -> Box<List> {
     #[cfg(not(windows))]
-    let _ = thin;
+    let _ = (thin, with_host);
     let list = Box::new(List {
         object: match (crate::device::newer(), thin) {
             (true, false) => Object::new(&NEWER_LIST_FUNCTIONS),
@@ -600,13 +632,7 @@ fn boxed(kind: u32, pipeline: This, thin: bool) -> Box<List> {
         newer: [0; 256],
         uploads: Default::default(),
         #[cfg(windows)]
-        host: crate::host::host().filter(|_| !thin).and_then(|h| match h.new_list() {
-            Ok(list) => Some(list),
-            Err(e) => {
-                tracing::warn!(error = %e, "no host command list");
-                None
-            }
-        }),
+        host: if !thin && with_host { fresh_list() } else { None },
         #[cfg(windows)]
         state: {
             let mut state = crate::draw::State::default();
@@ -678,12 +704,18 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
         let list = unsafe { &mut *this.cast_mut().cast::<List>() };
         list.earlier.clear();
         list.gate.clear();
+        if let Some(host) = list.host.as_ref() {
+            host.reset();
+        } else {
+            list.host = fresh_list();
+        }
+        if list.host.is_some() {
+            list.state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .reset(pipeline);
+        }
     }
-    #[cfg(windows)]
-    with_state(this, |host, state| {
-        host.reset();
-        state.reset(pipeline);
-    });
     crate::pipeline::bound(pipeline);
     #[cfg(not(windows))]
     let _ = this;
@@ -850,7 +882,7 @@ fn buffer_copy(this: This, list: &crate::host::HostList, to: *mut u8, from: *con
         return;
     }
     if list.place_copy(to as usize, from as usize, len) {
-        with_state(this, |_, state| state.copied());
+        with_state(this, |_, state| state.copied(to as usize, len));
     } else {
         list.defer_copy(to, from, len);
     }
@@ -1442,7 +1474,7 @@ extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags:
     {
         let len = len as usize;
         if list.place_copy(dst as usize, src as usize, len) {
-            with_state(this, |_, state| state.copied());
+            with_state(this, |_, state| state.copied(dst as usize, len));
             return;
         }
         list.defer(move || {
@@ -2128,12 +2160,198 @@ extern "system" fn wait_value64(this: This, address: u64, comparison: u32, refer
     wait_for(this, address, comparison, reference, true);
 }
 
+#[cfg(windows)]
+pub(super) fn barrier_groups_need_uav(count: u32, groups: *const u8) -> bool {
+    #[cfg(feature = "diagnostics")]
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_BARRIER_ACCESS_COMMON, D3D12_BARRIER_ACCESS_RAYTRACING_ACCELERATION_STRUCTURE_WRITE,
+        D3D12_BARRIER_ACCESS_UNORDERED_ACCESS, D3D12_BUFFER_BARRIER, D3D12_GLOBAL_BARRIER,
+        D3D12_TEXTURE_BARRIER,
+    };
+
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let filter_on = *ON.get_or_init(|| std::env::var_os("VICTORY_FILTER_BARRIER_GROUPS").is_none_or(|v| v != "0"));
+    if count == 0 {
+        return false;
+    }
+    if !filter_on {
+        return true;
+    }
+    const BARRIER_TYPE_GLOBAL: u32 = 0;
+    const BARRIER_TYPE_TEXTURE: u32 = 1;
+    const BARRIER_TYPE_BUFFER: u32 = 2;
+    const ACCESS_COMMON: u32 = D3D12_BARRIER_ACCESS_COMMON.0 as u32;
+    const ACCESS_UAV: u32 = D3D12_BARRIER_ACCESS_UNORDERED_ACCESS.0 as u32;
+    const ACCESS_RT_AS_WRITE: u32 = D3D12_BARRIER_ACCESS_RAYTRACING_ACCELERATION_STRUCTURE_WRITE.0 as u32;
+    const ACCESS_WRITE_UAV: u32 = ACCESS_UAV | ACCESS_RT_AS_WRITE;
+
+    fn inspect_barriers(
+        kind: u32,
+        num: u32,
+        ptr: u64,
+        stride: usize,
+        off_before: usize,
+        off_after: usize,
+        fallback_reason: usize,
+    ) -> Option<usize> {
+        if ptr == 0 || num > 64 {
+            return Some(fallback_reason);
+        }
+        let mut raw = vec![0u8; num as usize * stride];
+        if !crate::host::read_into(ptr as *const u8, &mut raw) {
+            return Some(fallback_reason);
+        }
+        for b in raw.chunks_exact(stride) {
+            let access_before = u32::from_le_bytes(b[off_before..off_before + 4].try_into().unwrap());
+            let access_after = u32::from_le_bytes(b[off_after..off_after + 4].try_into().unwrap());
+            #[cfg(feature = "diagnostics")]
+            {
+                use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+                static LOGGED: [AtomicUsize; 3] = [const { AtomicUsize::new(0) }; 3];
+                let slot = kind as usize;
+                if slot < 3 && LOGGED[slot].load(Relaxed) < 6 && LOGGED[slot].fetch_add(1, Relaxed) < 6 {
+                    let sync_before = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+                    let sync_after = u32::from_le_bytes([b[4], b[5], b[6], b[7]]);
+                    match kind {
+                        BARRIER_TYPE_TEXTURE => {
+                            let layout_before = u32::from_le_bytes([b[16], b[17], b[18], b[19]]);
+                            let layout_after = u32::from_le_bytes([b[20], b[21], b[22], b[23]]);
+                            tracing::info!(
+                                stride,
+                                sync_before = format_args!("{sync_before:#x}"),
+                                sync_after = format_args!("{sync_after:#x}"),
+                                access_before = format_args!("{access_before:#x}"),
+                                access_after = format_args!("{access_after:#x}"),
+                                layout_before,
+                                layout_after,
+                                "barrier_groups texture sample"
+                            );
+                        }
+                        BARRIER_TYPE_BUFFER => tracing::info!(
+                            stride,
+                            sync_before = format_args!("{sync_before:#x}"),
+                            sync_after = format_args!("{sync_after:#x}"),
+                            access_before = format_args!("{access_before:#x}"),
+                            access_after = format_args!("{access_after:#x}"),
+                            "barrier_groups buffer sample"
+                        ),
+                        _ => tracing::info!(
+                            stride,
+                            sync_before = format_args!("{sync_before:#x}"),
+                            sync_after = format_args!("{sync_after:#x}"),
+                            access_before = format_args!("{access_before:#x}"),
+                            access_after = format_args!("{access_after:#x}"),
+                            "barrier_groups global sample"
+                        ),
+                    }
+                }
+            }
+            let _ = kind;
+            if (access_before & ACCESS_WRITE_UAV) != 0 || (access_after & ACCESS_WRITE_UAV) != 0 {
+                return Some(match kind {
+                    BARRIER_TYPE_TEXTURE => 2,
+                    BARRIER_TYPE_BUFFER => 1,
+                    _ => 0,
+                });
+            }
+            if access_before == ACCESS_COMMON || access_after == ACCESS_COMMON {
+                return Some(match kind {
+                    BARRIER_TYPE_TEXTURE => 3,
+                    BARRIER_TYPE_BUFFER => 1,
+                    _ => 0,
+                });
+            }
+        }
+        None
+    }
+
+    // Reason codes under diagnostics: 0 = global/fallback, 1 = buffer, 2 = tex_uav, 3 = tex_common.
+    let mut keep_reason: Option<usize> = None;
+    if groups.is_null() || count > 32 {
+        keep_reason = Some(0);
+    } else {
+        let mut raw = vec![0u8; count as usize * 16];
+        if !crate::host::read_into(groups, &mut raw) {
+            keep_reason = Some(0);
+        } else {
+            for chunk in raw.chunks_exact(16) {
+                let kind = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                let num = u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
+                let ptr = u64::from_le_bytes([chunk[8], chunk[9], chunk[10], chunk[11], chunk[12], chunk[13], chunk[14], chunk[15]]);
+                if num == 0 {
+                    continue;
+                }
+                keep_reason = match kind {
+                    BARRIER_TYPE_GLOBAL => inspect_barriers(
+                        kind,
+                        num,
+                        ptr,
+                        size_of::<D3D12_GLOBAL_BARRIER>(),
+                        offset_of!(D3D12_GLOBAL_BARRIER, AccessBefore),
+                        offset_of!(D3D12_GLOBAL_BARRIER, AccessAfter),
+                        0,
+                    ),
+                    BARRIER_TYPE_TEXTURE => inspect_barriers(
+                        kind,
+                        num,
+                        ptr,
+                        size_of::<D3D12_TEXTURE_BARRIER>(),
+                        offset_of!(D3D12_TEXTURE_BARRIER, AccessBefore),
+                        offset_of!(D3D12_TEXTURE_BARRIER, AccessAfter),
+                        0,
+                    ),
+                    BARRIER_TYPE_BUFFER => inspect_barriers(
+                        kind,
+                        num,
+                        ptr,
+                        size_of::<D3D12_BUFFER_BARRIER>(),
+                        offset_of!(D3D12_BUFFER_BARRIER, AccessBefore),
+                        offset_of!(D3D12_BUFFER_BARRIER, AccessAfter),
+                        1,
+                    ),
+                    _ => Some(0),
+                };
+                if keep_reason.is_some() {
+                    break;
+                }
+            }
+        }
+    }
+    let need_uav = keep_reason.is_some();
+    #[cfg(feature = "diagnostics")]
+    {
+        use std::sync::atomic::AtomicU64;
+        static COUNTS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+        static REASONS: [AtomicUsize; 4] = [const { AtomicUsize::new(0) }; 4];
+        if let Some(reason) = keep_reason {
+            REASONS[reason].fetch_add(1, Relaxed);
+        }
+        let idx = usize::from(!need_uav);
+        let n = COUNTS[idx].fetch_add(1, Relaxed) + 1;
+        let total = COUNTS[0].load(Relaxed) + COUNTS[1].load(Relaxed);
+        if total == 100 || total.is_multiple_of(50_000) {
+            tracing::info!(
+                kept = COUNTS[0].load(Relaxed),
+                skipped = COUNTS[1].load(Relaxed),
+                last_n = n,
+                keep_global = REASONS[0].load(Relaxed),
+                keep_buffer = REASONS[1].load(Relaxed),
+                keep_tex_uav = REASONS[2].load(Relaxed),
+                keep_tex_common = REASONS[3].load(Relaxed),
+                "barrier_groups filtered (VICTORY_FILTER_BARRIER_GROUPS=0: off)"
+            );
+        }
+    }
+    need_uav
+}
+
 /// The enhanced barriers `(group count, groups)`: buffer, texture and
 /// global barriers with layouts instead of states. Every host use of a
 /// title texture (clears, copies) moves its host copy to the state it needs
 /// first, so only their ordering matters: one barrier on every shader
 /// write (the title's buffer barriers order compute passes).
-extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
+extern "system" fn barrier_groups(this: This, count: u32, groups: *const u8) {
     // Diagnostics: counted, and left out under `VICTORY_BARRIER_TEST=groups`.
     #[cfg(all(windows, feature = "diagnostics"))]
     if count > 0 {
@@ -2144,6 +2362,7 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
     }
     #[cfg(windows)]
     if count > 0
+        && (groups.is_null() || barrier_groups_need_uav(count, groups))
         && let Some(list) = host_list(this)
     {
         use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
@@ -2154,7 +2373,7 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
         unsafe { list.list.barriers(&[barrier]) };
     }
     #[cfg(not(windows))]
-    let _ = (this, count);
+    let _ = (this, count, groups);
 }
 
 /// The bottom-of-pipe value writes `(address, value, flush, flags)`, 32 and
@@ -2442,5 +2661,89 @@ mod tests {
         for object in [buffer, list, allocator] {
             assert_eq!(release(object), 0);
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn barrier_groups_filter_keeps_global_buffer_and_uav_textures_skips_rt_srv() {
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_BARRIER_ACCESS_COMMON, D3D12_BARRIER_ACCESS_COPY_DEST,
+            D3D12_BARRIER_ACCESS_DEPTH_STENCIL_READ,
+            D3D12_BARRIER_ACCESS_RAYTRACING_ACCELERATION_STRUCTURE_WRITE,
+            D3D12_BARRIER_ACCESS_RENDER_TARGET, D3D12_BARRIER_ACCESS_SHADER_RESOURCE,
+            D3D12_BARRIER_ACCESS_UNORDERED_ACCESS, D3D12_BUFFER_BARRIER, D3D12_GLOBAL_BARRIER,
+            D3D12_TEXTURE_BARRIER,
+        };
+
+        let common = D3D12_BARRIER_ACCESS_COMMON.0 as u32;
+        let rt = D3D12_BARRIER_ACCESS_RENDER_TARGET.0 as u32;
+        let uav = D3D12_BARRIER_ACCESS_UNORDERED_ACCESS.0 as u32;
+        let ds_read = D3D12_BARRIER_ACCESS_DEPTH_STENCIL_READ.0 as u32;
+        let srv = D3D12_BARRIER_ACCESS_SHADER_RESOURCE.0 as u32;
+        let copy_dest = D3D12_BARRIER_ACCESS_COPY_DEST.0 as u32;
+        let rt_as_write = D3D12_BARRIER_ACCESS_RAYTRACING_ACCELERATION_STRUCTURE_WRITE.0 as u32;
+
+        let make_group = |kind: u32, num: u32, ptr: u64| -> [u8; 16] {
+            let mut g = [0u8; 16];
+            g[0..4].copy_from_slice(&kind.to_le_bytes());
+            g[4..8].copy_from_slice(&num.to_le_bytes());
+            g[8..16].copy_from_slice(&ptr.to_le_bytes());
+            g
+        };
+        let make_barrier = |stride: usize, off_before: usize, off_after: usize, before: u32, after: u32| -> Vec<u8> {
+            let mut b = vec![0u8; stride];
+            b[off_before..off_before + 4].copy_from_slice(&before.to_le_bytes());
+            b[off_after..off_after + 4].copy_from_slice(&after.to_le_bytes());
+            b
+        };
+
+        // Null pointer fallbacks keep UAV barrier conservatively.
+        let g_global_null = make_group(0, 1, 0);
+        assert!(barrier_groups_need_uav(1, g_global_null.as_ptr()));
+        let g_buf_null = make_group(2, 1, 0);
+        assert!(barrier_groups_need_uav(1, g_buf_null.as_ptr()));
+
+        // Global barriers: non-UAV read-only transitions skip; UAV / COMMON / RT AS write keep.
+        let (gs, gb, ga) = (
+            size_of::<D3D12_GLOBAL_BARRIER>(),
+            offset_of!(D3D12_GLOBAL_BARRIER, AccessBefore),
+            offset_of!(D3D12_GLOBAL_BARRIER, AccessAfter),
+        );
+        let global_ro = make_barrier(gs, gb, ga, rt, srv);
+        assert!(!barrier_groups_need_uav(1, make_group(0, 1, global_ro.as_ptr() as u64).as_ptr()));
+        let global_uav = make_barrier(gs, gb, ga, uav, srv);
+        assert!(barrier_groups_need_uav(1, make_group(0, 1, global_uav.as_ptr() as u64).as_ptr()));
+        let global_rt_as = make_barrier(gs, gb, ga, rt_as_write, srv);
+        assert!(barrier_groups_need_uav(1, make_group(0, 1, global_rt_as.as_ptr() as u64).as_ptr()));
+
+        // Buffer barriers: COPY_DEST <-> SRV skip; UAV / COMMON / RT AS write keep.
+        let (bs, bb, ba) = (
+            size_of::<D3D12_BUFFER_BARRIER>(),
+            offset_of!(D3D12_BUFFER_BARRIER, AccessBefore),
+            offset_of!(D3D12_BUFFER_BARRIER, AccessAfter),
+        );
+        let buf_ro = make_barrier(bs, bb, ba, copy_dest, srv);
+        assert!(!barrier_groups_need_uav(1, make_group(2, 1, buf_ro.as_ptr() as u64).as_ptr()));
+        let buf_uav = make_barrier(bs, bb, ba, uav, srv);
+        assert!(barrier_groups_need_uav(1, make_group(2, 1, buf_uav.as_ptr() as u64).as_ptr()));
+        let buf_common = make_barrier(bs, bb, ba, common, srv);
+        assert!(barrier_groups_need_uav(1, make_group(2, 1, buf_common.as_ptr() as u64).as_ptr()));
+        let buf_rt_as = make_barrier(bs, bb, ba, rt_as_write, srv);
+        assert!(barrier_groups_need_uav(1, make_group(2, 1, buf_rt_as.as_ptr() as u64).as_ptr()));
+
+        // Texture barriers: UAV / COMMON / RT AS write keep; RT -> SRV and RT -> DS_READ skip.
+        let (ts, tb, ta) = (
+            size_of::<D3D12_TEXTURE_BARRIER>(),
+            offset_of!(D3D12_TEXTURE_BARRIER, AccessBefore),
+            offset_of!(D3D12_TEXTURE_BARRIER, AccessAfter),
+        );
+        let tex_uav = make_barrier(ts, tb, ta, uav, srv);
+        assert!(barrier_groups_need_uav(1, make_group(1, 1, tex_uav.as_ptr() as u64).as_ptr()));
+        let tex_common = make_barrier(ts, tb, ta, common, srv);
+        assert!(barrier_groups_need_uav(1, make_group(1, 1, tex_common.as_ptr() as u64).as_ptr()));
+        let tex_rt_srv = make_barrier(ts, tb, ta, rt, srv);
+        assert!(!barrier_groups_need_uav(1, make_group(1, 1, tex_rt_srv.as_ptr() as u64).as_ptr()));
+        let tex_rt_ds = make_barrier(ts, tb, ta, rt, ds_read);
+        assert!(!barrier_groups_need_uav(1, make_group(1, 1, tex_rt_ds.as_ptr() as u64).as_ptr()));
     }
 }

@@ -10,8 +10,10 @@ use std::sync::atomic::AtomicU64;
 use anyhow::{Context, Result, bail};
 use victory_pe::{ImageInfo, ImportSymbol};
 use windows_sys::Win32::Foundation::{FreeLibrary, HMODULE};
+use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
 use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryExW};
-use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
+use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, PAGE_READWRITE, VirtualProtect};
+use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
 use crate::thunks::{ImportSite, ThunkBlock, UnimplementedPolicy};
 use crate::{
@@ -83,6 +85,7 @@ pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
     if !loaded.info.is_dll() {
         // SAFETY: just mapped, and no title code has run.
         unsafe { crate::tls::redirect(loaded.base(), &loaded.info) }?;
+        apply_title_patches(loaded.base(), &loaded.info);
     }
     tracing::info!(
         base = format_args!("{:#x}", loaded.base()),
@@ -423,5 +426,87 @@ impl LoadedImage {
         crate::threads::unmapped(self.base());
         // SAFETY: guaranteed by the caller.
         unsafe { FreeLibrary(self.module) };
+    }
+}
+
+fn rva_in_sections(info: &ImageInfo, rva: usize, len: usize) -> bool {
+    info.sections.iter().any(|s| {
+        let start = s.rva as usize;
+        let end = start.saturating_add(s.virtual_size as usize);
+        rva >= start && rva.saturating_add(len) <= end
+    })
+}
+
+fn patch_if_matches(
+    base: usize,
+    info: &ImageInfo,
+    what: &str,
+    sig_rva: usize,
+    sig_expect: &[u8],
+    patch_rva: usize,
+    patch_bytes: &[u8],
+) -> bool {
+    if !rva_in_sections(info, sig_rva, sig_expect.len())
+        || !rva_in_sections(info, patch_rva, patch_bytes.len())
+    {
+        tracing::warn!(what, rva = format_args!("{patch_rva:#x}"), "RVA outside mapped sections; skipping patch");
+        return false;
+    }
+    // SAFETY: verified `sig_rva..sig_rva + sig_expect.len()` lies inside a mapped PE section.
+    let actual = unsafe { std::slice::from_raw_parts((base + sig_rva) as *const u8, sig_expect.len()) };
+    if actual != sig_expect {
+        tracing::warn!(what, rva = format_args!("{patch_rva:#x}"), "signature mismatch; skipping patch");
+        return false;
+    }
+    let addr = (base + patch_rva) as *mut u8;
+    let mut old = 0u32;
+    // SAFETY: `addr..addr + patch_bytes.len()` is inside the mapped PE section verified above.
+    unsafe {
+        if VirtualProtect(addr.cast(), patch_bytes.len(), PAGE_EXECUTE_READWRITE, &mut old) == 0 {
+            tracing::warn!(what, error = %std::io::Error::last_os_error(), "VirtualProtect failed");
+            return false;
+        }
+        std::ptr::copy_nonoverlapping(patch_bytes.as_ptr(), addr, patch_bytes.len());
+        let _ = VirtualProtect(addr.cast(), patch_bytes.len(), old, &mut old);
+        let _ = FlushInstructionCache(GetCurrentProcess(), addr.cast(), patch_bytes.len());
+    }
+    true
+}
+
+/// Signature-verified in-memory patches for build 1.0.2.1 (`VICTORY_OWN_UPSCALER=1`).
+/// `VICTORY_RENDER_SCALE`, `VICTORY_OUTPUT`, and `VICTORY_UPSCALER` are handled by
+/// `crate::resolution`.
+fn apply_title_patches(base: usize, info: &ImageInfo) {
+    if std::env::var_os("VICTORY_OWN_UPSCALER").is_some_and(|v| v == "1") {
+        const SIG_RVA: usize = 0x7e941f;
+        const PATCH_RVA: usize = 0x7e9426;
+        const EXPECTED: [u8; 13] = [0x84, 0xC0, 0xB8, 0x06, 0x00, 0x00, 0x00, 0x0F, 0x45, 0xC1, 0x48, 0x83, 0xC4];
+        const NOP3: [u8; 3] = [0x0F, 0x1F, 0x00];
+        if patch_if_matches(base, info, "VICTORY_OWN_UPSCALER", SIG_RVA, &EXPECTED, PATCH_RVA, &NOP3) {
+            tracing::info!(rva = format_args!("{PATCH_RVA:#x}"), "VICTORY_OWN_UPSCALER=1: switched title to native temporal upscaler");
+        }
+    }
+}
+
+#[cfg(test)]
+mod patch_tests {
+    use victory_pe::SectionInfo;
+
+    #[test]
+    fn own_upscaler_signature_covers_patch_site() {
+        const SIG_RVA: usize = 0x7e941f;
+        const PATCH_RVA: usize = 0x7e9426;
+        const EXPECTED: [u8; 13] = [0x84, 0xC0, 0xB8, 0x06, 0x00, 0x00, 0x00, 0x0F, 0x45, 0xC1, 0x48, 0x83, 0xC4];
+        let off = PATCH_RVA - SIG_RVA;
+        assert_eq!(&EXPECTED[off..off + 3], &[0x0F, 0x45, 0xC1]);
+        let sec = SectionInfo {
+            name: ".text".into(),
+            rva: 0x1000,
+            virtual_size: 0x100_0000,
+            file_offset: 0x400,
+            file_size: 0x100_0000,
+            characteristics: 0,
+        };
+        assert!(SIG_RVA >= sec.rva as usize && SIG_RVA + EXPECTED.len() <= (sec.rva + sec.virtual_size) as usize);
     }
 }

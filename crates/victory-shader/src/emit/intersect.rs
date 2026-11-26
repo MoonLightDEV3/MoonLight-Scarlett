@@ -59,6 +59,11 @@ struct Ray {
     inverse: [V; 3],
 }
 
+fn bvh_miss_only() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_MISS").is_some_and(|v| v == "1"))
+}
+
 impl<'a> Lower<'a> {
     /// `image_bvh_intersect_ray` and `image_bvh64_intersect_ray`.
     pub(super) fn bvh(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
@@ -134,6 +139,19 @@ impl<'a> Lower<'a> {
             direction: [f[4], f[5], f[6]],
             inverse: [f[7], f[8], f[9]],
         };
+        if bvh_miss_only() {
+            let c = self.cur;
+            let (k4, k6) = (self.s.m.i32(4), self.s.m.i32(6));
+            let pair = self.s.m.bin(c, Bin::And, pointer, k6);
+            let is_box = self.s.m.cmp(c, pred::EQ, pair, k4);
+            let none = self.s.m.i32(bvh::NONE);
+            let miss = bvh::MISS.map(|f| self.s.m.i32(f.to_bits()));
+            for k in 0..4 {
+                let val = self.s.m.select(c, is_box, none, miss[k]);
+                self.write(inst, Reg::V(dst + k as u8), val, guard);
+            }
+            return Ok(());
+        }
         let c = self.cur;
         let at = match nodes {
             BvhNodes::Resource => {

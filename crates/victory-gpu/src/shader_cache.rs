@@ -19,6 +19,7 @@
 //! The entry is our own encoding of [`HostShader`]: a field added to it
 //! must be added to `encode` and `decode` too, and [`FORMAT`] bumped.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -123,6 +124,7 @@ fn build() -> [u8; 32] {
             "VICTORY_MESH_OUTPUT_STRICT",
             "VICTORY_BVH_FENCES",
             "VICTORY_BVH_BOUNDS",
+            "VICTORY_BVH_MISS",
         ] {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');
@@ -170,12 +172,65 @@ pub fn precompile(container: &[u8]) -> Result<bool, String> {
     Ok(MISSES.load(Ordering::Relaxed) == misses)
 }
 
+fn parse_own_loop_limits(raw: Option<&str>) -> HashMap<String, u32> {
+    let mut map = HashMap::new();
+    let Some(raw) = raw else { return map };
+    for item in raw.split(|c: char| c == ',' || c == ';' || c.is_whitespace()) {
+        let Some((hash, val)) = item.trim().split_once(':') else { continue };
+        let hash = hash.trim().to_ascii_lowercase();
+        let val = val.trim();
+        if hash.len() != 16 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+            continue;
+        }
+        let parsed = if let Some(hex) = val.strip_prefix("0x").or_else(|| val.strip_prefix("0X")) {
+            u32::from_str_radix(hex, 16).ok()
+        } else {
+            val.parse::<u32>().ok()
+        };
+        if let Some(limit) = parsed.filter(|&l| l >= 1) {
+            map.insert(hash, limit);
+        }
+    }
+    map
+}
+
+fn own_loop_limit(container: &[u8]) -> Option<u32> {
+    static LIMITS: OnceLock<HashMap<String, u32>> = OnceLock::new();
+    let limits = LIMITS.get_or_init(|| {
+        let map = parse_own_loop_limits(std::env::var("VICTORY_SHADER_LOOP_LIMITS").ok().as_deref());
+        if !map.is_empty() {
+            tracing::warn!(count = map.len(), "VICTORY_SHADER_LOOP_LIMITS active for targeted shader hashes");
+        }
+        map
+    });
+    if limits.is_empty() {
+        return None;
+    }
+    let hex = blake3::hash(container).to_hex();
+    limits.get(&hex[..16]).copied()
+}
+
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+    let own = own_loop_limit(container);
+    let translate = |c: &[u8]| match own {
+        Some(limit) => victory_shader::emit::with_loop_limit(limit, || victory_shader::emit::translate(c)),
+        None => victory_shader::emit::translate(c),
+    }
+    .map_err(|e| e.to_string());
+    let key_build = match own {
+        Some(limit) => {
+            let mut h = blake3::Hasher::new();
+            h.update(&build());
+            h.update(b"loop limit of its own");
+            h.update(&limit.to_le_bytes());
+            *h.finalize().as_bytes()
+        }
+        None => build(),
+    };
     match CACHE.get() {
-        Some(cache) => cached(cache, &build(), container, translate, refresh_in_runs()),
+        Some(cache) => cached(cache, &key_build, container, translate, refresh_in_runs()),
         None => translate(container),
     }
 }
@@ -584,5 +639,17 @@ mod tests {
         // (Other tests count too; these at least.)
         let (s, r, c) = stale_counts();
         assert!(s >= stale + 2 && r > refreshed && c > changed, "{s} {r} {c}");
+    }
+
+    #[test]
+    fn parse_own_loop_limits_handles_valid_and_invalid_entries() {
+        let map = super::parse_own_loop_limits(Some(
+            "39F0E9AEB156A61C:64, 8e614708143ef917:0x100; bad:10; short:32; 0123456789abcdef:0; 0123456789abcdef:16",
+        ));
+        assert_eq!(map.get("39f0e9aeb156a61c"), Some(&64));
+        assert_eq!(map.get("8e614708143ef917"), Some(&256));
+        assert_eq!(map.get("0123456789abcdef"), Some(&16));
+        assert_eq!(map.len(), 3);
+        assert!(super::parse_own_loop_limits(None).is_empty());
     }
 }

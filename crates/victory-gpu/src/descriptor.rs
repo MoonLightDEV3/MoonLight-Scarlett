@@ -1093,22 +1093,22 @@ struct Views {
     /// Entries naming each resource.
     by_resource: std::collections::BTreeMap<usize, Vec<u32>>,
     free: Vec<u32>,
-    /// The shapes of views of placed memory, and where each is.
-    shapes: Vec<Shape>,
-    shape_index: std::collections::BTreeMap<Shape, u32>,
+    /// Where each placed view shape lives in [`SHAPE_CHUNKS_PTR`].
+    shape_index: Option<std::collections::HashMap<Shape, u32>>,
 }
 
 /// Read far more often than written: every slot a draw reads through a
 /// table is looked up here, on several recording threads at once in the
 /// world. Readers share it; only a view not seen before (a new table entry
-/// or shape) and a released resource take it alone.
+/// or shape) and a released resource take it alone. Placed view shapes are
+/// stored in an append-only lock-free chunk table so [`view_at`] resolves
+/// placed views without taking `VIEWS`.
 static VIEWS: std::sync::RwLock<Views> = std::sync::RwLock::new(Views {
     list: Vec::new(),
     index: std::collections::BTreeMap::new(),
     by_resource: std::collections::BTreeMap::new(),
     free: Vec::new(),
-    shapes: Vec::new(),
-    shape_index: std::collections::BTreeMap::new(),
+    shape_index: None,
 });
 pub(crate) const VIEW_TAG: u32 = u32::from_le_bytes(*b"vVIE");
 
@@ -1134,6 +1134,28 @@ const SHAPES: usize = 1 << (62 - PLACED_ADDRESS_BITS);
 /// access, the resource description, and the view's words but the two that
 /// hold the address (10 and 11).
 type Shape = (bool, [u32; 14], [u32; 14]);
+
+const SHAPE_CHUNK_SHIFT: usize = 12;
+const SHAPE_CHUNK_LEN: usize = 1 << SHAPE_CHUNK_SHIFT;
+const SHAPE_CHUNKS: usize = SHAPES >> SHAPE_CHUNK_SHIFT;
+
+static SHAPE_CHUNKS_PTR: [std::sync::atomic::AtomicPtr<Shape>; SHAPE_CHUNKS] =
+    [const { std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()) }; SHAPE_CHUNKS];
+static SHAPE_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn shape_at(id: usize) -> Option<Shape> {
+    use std::sync::atomic::Ordering::Acquire;
+    if id >= SHAPE_COUNT.load(Acquire) {
+        return None;
+    }
+    let ptr = SHAPE_CHUNKS_PTR[id >> SHAPE_CHUNK_SHIFT].load(Acquire);
+    if ptr.is_null() {
+        return None;
+    }
+    // SAFETY: `id < SHAPE_COUNT` (stored with Release after writing the slot and
+    // publishing `ptr` with Release), and published shape slots are immutable.
+    Some(unsafe { *ptr.add(id & (SHAPE_CHUNK_LEN - 1)) })
+}
 
 /// Whether constant buffer views and views of placed memory are named whole
 /// in their records ([`Views`]). On by default; `VICTORY_VIEW_INLINE=0`
@@ -1205,28 +1227,27 @@ impl Views {
     /// The number of `shape`, a new one if it is not there yet; `None` when
     /// the shapes are full (the view is then a table entry).
     fn shape(&mut self, shape: Shape) -> Option<u32> {
-        if let Some(&at) = self.shape_index.get(&shape) {
+        use std::sync::atomic::Ordering::{Relaxed, Release};
+        if let Some(&at) = self.shape_index.as_ref().and_then(|m| m.get(&shape)) {
             return Some(at);
         }
-        if self.shapes.len() >= SHAPES {
+        let at = SHAPE_COUNT.load(Relaxed);
+        if at >= SHAPES {
             return None;
         }
-        let at = self.shapes.len() as u32;
-        self.shapes.push(shape);
-        self.shape_index.insert(shape, at);
-        Some(at)
-    }
-
-    /// The view of placed memory [`placed_words`] named.
-    fn placed_of(&self, i: u32, generation: u32) -> Option<View> {
-        let payload = payload(i, generation);
-        let address = payload & ((1 << PLACED_ADDRESS_BITS) - 1);
-        let &(unordered, resource, rest) = self.shapes.get((payload >> PLACED_ADDRESS_BITS) as usize)?;
-        let mut desc = [0u32; 16];
-        desc[..10].copy_from_slice(&rest[..10]);
-        (desc[10], desc[11]) = (address as u32, (address >> 32) as u32);
-        desc[12..].copy_from_slice(&rest[10..]);
-        Some(View::Placed(unordered, resource, desc))
+        let (chunk, slot) = (at >> SHAPE_CHUNK_SHIFT, at & (SHAPE_CHUNK_LEN - 1));
+        let mut ptr = SHAPE_CHUNKS_PTR[chunk].load(Relaxed);
+        if ptr.is_null() {
+            let alloc = vec![(false, [0u32; 14], [0u32; 14]); SHAPE_CHUNK_LEN].into_boxed_slice();
+            ptr = Box::into_raw(alloc) as *mut Shape;
+            SHAPE_CHUNKS_PTR[chunk].store(ptr, Release);
+        }
+        // SAFETY: `VIEWS` write lock serializes writers and `slot < SHAPE_CHUNK_LEN`.
+        unsafe { ptr.add(slot).write(shape) };
+        SHAPE_COUNT.store(at + 1, Release);
+        let at_u32 = at as u32;
+        self.shape_index.get_or_insert_with(Default::default).insert(shape, at_u32);
+        Some(at_u32)
     }
 
     /// The record words of `view` as a table entry, if it has one.
@@ -1262,6 +1283,18 @@ impl Views {
     }
 }
 
+/// The view of placed memory [`placed_words`] named, resolved lock-free.
+fn placed_of(i: u32, generation: u32) -> Option<View> {
+    let payload = payload(i, generation);
+    let address = payload & ((1 << PLACED_ADDRESS_BITS) - 1);
+    let (unordered, resource, rest) = shape_at((payload >> PLACED_ADDRESS_BITS) as usize)?;
+    let mut desc = [0u32; 16];
+    desc[..10].copy_from_slice(&rest[..10]);
+    (desc[10], desc[11]) = (address as u32, (address >> 32) as u32);
+    desc[12..].copy_from_slice(&rest[10..]);
+    Some(View::Placed(unordered, resource, desc))
+}
+
 /// The two words that name `view` in a record: the view itself where its
 /// kind allows ([`Views`]), else its table entry.
 fn words_for(view: View) -> [u32; 2] {
@@ -1278,7 +1311,7 @@ fn words_for(view: View) -> [u32; 2] {
                 let (shape, address) = shape_of(*unordered, resource, desc);
                 if address >> PLACED_ADDRESS_BITS == 0 {
                     // Nearly every placed view has a shape seen before.
-                    let known = views_read().shape_index.get(&shape).copied();
+                    let known = views_read().shape_index.as_ref().and_then(|m| m.get(&shape).copied());
                     let shape = known.or_else(|| views_write().shape(shape));
                     if let Some(shape) = shape {
                         NAMED_WHOLE[1].fetch_add(1, Relaxed);
@@ -1326,16 +1359,18 @@ pub(crate) fn views_kept() -> [u64; 8] {
             _ => {}
         }
     }
+    let shape_count = SHAPE_COUNT.load(Relaxed) as u64;
+    let shape_index_len = views.shape_index.as_ref().map_or(0, |m| m.len()) as u64;
     [
         views.list.len() as u64,
         views.free.len() as u64,
         views.list.capacity() as u64 * each
             + views.index.len() as u64 * each * 3 / 2
-            + views.shapes.capacity() as u64 * shape
-            + views.shape_index.len() as u64 * shape * 3 / 2,
+            + shape_count.next_multiple_of(SHAPE_CHUNK_LEN as u64) * shape
+            + shape_index_len * shape * 3 / 2,
         constants,
         placed,
-        views.shapes.len() as u64,
+        shape_count,
         NAMED_WHOLE[0].load(Relaxed),
         NAMED_WHOLE[1].load(Relaxed),
     ]
@@ -1503,7 +1538,7 @@ fn view_at(i: u32, generation: u32) -> Option<View> {
             (*current == generation).then(|| view.clone())
         }
         CONSTANT => Some(constant_of(i, generation)),
-        PLACED => views_read().placed_of(i, generation),
+        PLACED => placed_of(i, generation),
         _ => None,
     }
 }
@@ -1993,7 +2028,12 @@ mod tests {
             _ => false,
         };
         let entries = || VIEWS.read().unwrap().list.iter().filter(|(v, _)| mine(v)).count();
-        let shapes = || VIEWS.read().unwrap().shapes.iter().filter(|s| s.1 == resource).count();
+        let shapes = || {
+            (0..SHAPE_COUNT.load(std::sync::atomic::Ordering::Acquire))
+                .filter_map(shape_at)
+                .filter(|s| s.1 == resource)
+                .count()
+        };
         for n in 0..20_000u64 {
             let address = 0x6_0000_0000 + n * 0x100;
             create_cbv(null, &[address as u32, (address >> 32) as u32, 512, 0], at);
@@ -2074,5 +2114,33 @@ mod tests {
         // A size that does not match the count is not a placement.
         assert_eq!(create(desc, Placement { address, size: 7 }, &mut h), S_OK);
         assert_ne!(slot::<extern "system" fn(This) -> u64>(h, 0x48)(h), address);
+    }
+
+    #[test]
+    fn placed_shapes_lock_free_lookup_across_chunk_boundary() {
+        let count = SHAPE_CHUNK_LEN + 64;
+        let base_id = 0x9900_0000u32;
+        let mut expected = Vec::with_capacity(count);
+        for n in 0..count {
+            let mut resource = [0u32; 14];
+            resource[0] = base_id;
+            resource[1] = n as u32;
+            let mut desc = [0u32; 16];
+            desc[0] = 0xabcd_0000 + n as u32;
+            let addr = 0x1_0000_0000u64 + (n as u64) * 0x100;
+            desc[10] = addr as u32;
+            desc[11] = (addr >> 32) as u32;
+            let (shape, _) = shape_of(n % 2 == 1, &resource, &desc);
+            let id = views_write().shape(shape).expect("shape slot");
+            expected.push((id, addr, resource, desc, n % 2 == 1));
+        }
+        for (id, addr, resource, desc, unordered) in expected {
+            let [lo, hi] = placed_words(id, addr);
+            assert_eq!(
+                view_at(lo, hi),
+                Some(View::Placed(unordered, resource, desc)),
+                "shape {id} across chunk boundary"
+            );
+        }
     }
 }

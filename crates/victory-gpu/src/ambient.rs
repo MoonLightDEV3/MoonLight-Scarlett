@@ -325,6 +325,7 @@ void clear_air(uint3 at : SV_DispatchThreadID) {
     float far = float(at.z) / float(d);
     float cap = air * lerp(dot(cells[CELLS].rgb, LUMA), dot(seen_there, LUMA), far);
     float3 c = scattered[at];
+    if (any(isnan(c)) || any(isinf(c))) { scattered[at] = 0; return; }
     float has = dot(c, LUMA);
     if (has > cap) scattered[at] = c * (cap / has);
 }
@@ -492,7 +493,7 @@ fn pass() -> Option<&'static Pass> {
     static PASS: OnceLock<Option<Pass>> = OnceLock::new();
     PASS.get_or_init(|| {
         let host = host()?;
-        make(&host.device, |bytes| host.uav_buffer(bytes))
+        make(&host.device, |bytes| host.uav_buffer_internal(bytes))
             .inspect_err(|e| tracing::warn!(error = %e, "no stand-in for the indirect light"))
             .ok()
     })
@@ -639,6 +640,6 @@ mod tests {
         let Some(host) = host() else {
             return;
         };
-        make(&host.device, |bytes| host.uav_buffer(bytes)).expect("the passes");
+        make(&host.device, |bytes| host.uav_buffer_internal(bytes)).expect("the passes");
     }
 }

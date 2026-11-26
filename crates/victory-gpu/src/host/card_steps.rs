@@ -100,7 +100,7 @@ fn placed_order() -> bool {
         return on;
     }
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| crate::switch::on("VICTORY_PLACED_ORDER"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PLACED_ORDER").is_none_or(|v| v != "0"))
 }
 
 /// Why [`plan`] refuses for [`place`].
@@ -262,6 +262,8 @@ fn plan(does: &[Does], stage: u32, by_order: bool, behind: &mut Option<(usize, u
         _ => Ok(()),
     };
     let mut taken = vec![false; does.len()];
+    let mut taken_count = 0usize;
+    let mut has_placed = false;
     let (mut read, mut written) = (Vec::new(), Vec::new());
     let mut more = Vec::new();
     for (i, d) in does.iter().enumerate() {
@@ -269,6 +271,7 @@ fn plan(does: &[Does], stage: u32, by_order: bool, behind: &mut Option<(usize, u
             Does::Run => return Err("a step of ours runs"),
             Does::Read { asked: true, .. } => return Err("a texture reads it"),
             Does::Copy { asked: true, .. } | Does::Fill { asked: true, .. } => more.push(i),
+            Does::Placed { .. } => has_placed = true,
             _ => {}
         }
     }
@@ -278,7 +281,10 @@ fn plan(does: &[Does], stage: u32, by_order: bool, behind: &mut Option<(usize, u
         let (mut reads, mut writes) = (Vec::new(), Vec::new());
         for i in std::mem::take(&mut more) {
             takes(&does[i])?;
-            taken[i] = true;
+            if !taken[i] {
+                taken[i] = true;
+                taken_count += 1;
+            }
             if let Some((r, w)) = reads_writes(&does[i]) {
                 if w.0 < w.1 && meet(r, w) {
                     return Err("a copy onto itself");
@@ -291,60 +297,77 @@ fn plan(does: &[Does], stage: u32, by_order: bool, behind: &mut Option<(usize, u
         if writes.iter().any(|w| w.0 < w.1) {
             join_ranges(&mut written, writes);
         }
-        if taken.iter().filter(|t| **t).count() > MOST {
+        if taken_count > MOST {
             return Err("too many steps depend on it");
         }
-        for (i, d) in does.iter().enumerate() {
-            // A fill that cannot be taken is looked at below.
-            if taken[i] || matches!(d, Does::Fill { to: false, .. }) {
-                continue;
+        if written.is_empty() {
+            for (i, d) in does.iter().enumerate() {
+                if taken[i] {
+                    continue;
+                }
+                if let Does::Copy { dst, len, .. } = *d
+                    && touched(&read, (dst, dst + len))
+                {
+                    more.push(i);
+                }
             }
-            if let Some((r, w)) = reads_writes(d)
-                && (touched(&written, r) || touched(&written, w) || touched(&read, w))
-            {
-                more.push(i);
+        } else {
+            for (i, d) in does.iter().enumerate() {
+                // A fill that cannot be taken is looked at below.
+                if taken[i] || matches!(d, Does::Fill { to: false, .. }) {
+                    continue;
+                }
+                if let Some((r, w)) = reads_writes(d)
+                    && (touched(&written, r) || touched(&written, w) || touched(&read, w))
+                {
+                    more.push(i);
+                }
             }
         }
     }
     // A copy at its place in a list comes after what is done in front of all
     // of them: as it should after the steps ahead of it, but not after those
     // behind it that read or write its bytes.
-    for (p, d) in does.iter().enumerate() {
-        if let Does::Placed { dst, src, len } = *d
-            && (touched(&read, (dst, dst + len)) || touched(&written, (dst, dst + len)) || touched(&written, (src, src + len)))
-        {
-            let (to, from) = ((dst, dst + len), (src, src + len));
-            let in_the_way = |i: usize| {
-                reads_writes(&does[i]).is_some_and(|(r, w)| meet(r, to) || w.0 < w.1 && (meet(w, to) || meet(w, from)))
-            };
-            let found = (p + 1..does.len()).find(|&i| taken[i] && in_the_way(i));
-            *behind = found.map(|i| (p, i));
-            if !by_order || found.is_some() {
-                return Err(BEHIND_PLACED);
+    if has_placed {
+        for (p, d) in does.iter().enumerate() {
+            if let Does::Placed { dst, src, len } = *d
+                && (touched(&read, (dst, dst + len)) || touched(&written, (dst, dst + len)) || touched(&written, (src, src + len)))
+            {
+                let (to, from) = ((dst, dst + len), (src, src + len));
+                let in_the_way = |i: usize| {
+                    reads_writes(&does[i]).is_some_and(|(r, w)| meet(r, to) || w.0 < w.1 && (meet(w, to) || meet(w, from)))
+                };
+                let found = (p + 1..does.len()).find(|&i| taken[i] && in_the_way(i));
+                *behind = found.map(|i| (p, i));
+                if !by_order || found.is_some() {
+                    return Err(BEHIND_PLACED);
+                }
             }
         }
     }
     let order: Vec<usize> = (0..does.len()).filter(|&i| taken[i]).collect();
     // What stays on the CPU and reads what an earlier taken copy writes
     // would read it too early.
-    let mut behind: Vec<(usize, usize)> = Vec::new();
-    for (i, d) in does.iter().enumerate() {
-        if taken[i] {
-            if let Some((_, w)) = reads_writes(d)
-                && w.0 < w.1
-            {
-                join_ranges(&mut behind, [w]);
+    if !written.is_empty() {
+        let mut behind: Vec<(usize, usize)> = Vec::new();
+        for (i, d) in does.iter().enumerate() {
+            if taken[i] {
+                if let Some((_, w)) = reads_writes(d)
+                    && w.0 < w.1
+                {
+                    join_ranges(&mut behind, [w]);
+                }
+                continue;
             }
-            continue;
-        }
-        match *d {
-            Does::Read { from, to, .. } if touched(&behind, (from, to)) => {
-                return Err("a texture or expanded vertices read what it writes");
+            match *d {
+                Does::Read { from, to, .. } if touched(&behind, (from, to)) => {
+                    return Err("a texture or expanded vertices read what it writes");
+                }
+                Does::Fill { src, len, .. } if touched(&behind, (src, src + len)) => {
+                    return Err("a fill of memory the card cannot be given the bytes of reads what it writes");
+                }
+                _ => {}
             }
-            Does::Fill { src, len, .. } if touched(&behind, (src, src + len)) => {
-                return Err("a fill of memory the card cannot be given the bytes of reads what it writes");
-            }
-            _ => {}
         }
     }
     let mut out: Vec<(usize, u32)> = Vec::with_capacity(order.len());
@@ -359,15 +382,24 @@ fn plan(does: &[Does], stage: u32, by_order: bool, behind: &mut Option<(usize, u
         let mut level = 0;
         // Behind what writes what this reads or writes, and, if this
         // writes, behind what reads it.
-        let ahead: Box<dyn Iterator<Item = usize>> =
-            if writes { Box::new(0..out.len()) } else { Box::new(copies.iter().copied()) };
-        for k in ahead {
-            let (j, at): (usize, u32) = out[k];
-            let Some((jr, jw)) = reads_writes(&does[j]) else {
-                continue;
-            };
-            if at >= level && (meet(jw, r) || meet(jw, w) || meet(jr, w)) {
-                level = at + 1;
+        if writes {
+            for &(j, at) in &out {
+                let Some((jr, jw)) = reads_writes(&does[j]) else {
+                    continue;
+                };
+                if at >= level && (meet(jw, r) || meet(jw, w) || meet(jr, w)) {
+                    level = at + 1;
+                }
+            }
+        } else if !copies.is_empty() {
+            for &k in &copies {
+                let (j, at) = out[k];
+                let Some((_, jw)) = reads_writes(&does[j]) else {
+                    continue;
+                };
+                if at >= level && meet(jw, r) {
+                    level = at + 1;
+                }
             }
         }
         if writes {
@@ -413,10 +445,11 @@ fn holder(writers: &[Writer], from: usize, to: usize) -> Result<Arc<Shadow>, &'s
 /// What the steps of `runs` do, and which step each is (its list by address,
 /// its place in it). `written`: what flights may write.
 fn does_of(written: &[(usize, usize)], runs: &[&HostList]) -> (Vec<Does>, Vec<(usize, usize)>) {
-    let mut does = Vec::new();
+    let cap: usize = runs.iter().map(|l| l.deferred().copies.len()).sum();
+    let mut does = Vec::with_capacity(cap);
     // Which step each is. One list's lock at a time: a submission may
     // name a list twice.
-    let mut steps = Vec::new();
+    let mut steps = Vec::with_capacity(cap);
     for list in runs {
         for (i, step) in list.deferred().copies.iter().enumerate() {
             does.push(match step {
@@ -866,7 +899,7 @@ impl Host {
             own.list.reset();
             return Some(own);
         }
-        let between = self.uav_buffer(BETWEEN)?;
+        let between = self.uav_buffer_internal(BETWEEN)?;
         name(&between, || "copies of title memory on the card".into());
         let list = self.new_list().ok()?;
         Some(Own { list, between })

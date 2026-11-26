@@ -580,7 +580,18 @@ pub(crate) static HEAP_BUFFER_MICROS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static HEAP_SPLIT: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
 /// Passes after which every buffer slot of the heap was looked at again.
+#[cfg(test)]
 const HEAP_ROUND: u64 = 16;
+
+fn heap_round() -> u64 {
+    static ROUND: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *ROUND.get_or_init(|| {
+        std::env::var("VICTORY_HEAP_ROUND")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(32, |v| v.clamp(1, 64).next_power_of_two())
+    })
+}
 
 /// Whether the slots looked at again for no write are a part of them at
 /// every pass, each slot at every sixteenth (`VICTORY_HEAP_SPREAD=0`: all of
@@ -835,6 +846,9 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
         crate::book::root(gpu, len);
         return Some(gpu);
     }
+    if let Some((_, gpu)) = list.place_constants(address, len as u32) {
+        return Some(gpu);
+    }
     list.fill_scratch(address as *const u8, len)
 }
 
@@ -867,16 +881,26 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     let mut kept = host.buffer_sweep.lock().unwrap_or_else(|e| e.into_inner());
     let BufferSweep { passes, ranges, unwatched } = &mut *kept;
     let changed = host.buffer_changes();
-    let all = *passes == 0 || (*passes % HEAP_ROUND == 0 && !heap_spread());
+    let round = heap_round();
+    let all = *passes == 0 || (*passes % round == 0 && !heap_spread());
     let slots = if all {
         ranges.0.clear();
         host.buffer_slots()
     } else if heap_spread() {
         // The written ones, and this pass's part of the others.
-        let (part, parts) = ((*passes % HEAP_ROUND) as u32, HEAP_ROUND as u32);
+        let (part, parts) = ((*passes % round) as u32, round as u32);
         ranges.forget_part(part, parts);
-        let mut slots = host.buffer_slots_of::<{ HEAP_ROUND as u32 }>(part);
-        slots.extend(changed);
+        let mut slots = match parts {
+            1 => host.buffer_slots_of::<1>(part),
+            2 => host.buffer_slots_of::<2>(part),
+            4 => host.buffer_slots_of::<4>(part),
+            8 => host.buffer_slots_of::<8>(part),
+            16 => host.buffer_slots_of::<16>(part),
+            32 => host.buffer_slots_of::<32>(part),
+            64 => host.buffer_slots_of::<64>(part),
+            _ => host.buffer_slots(),
+        };
+        slots.extend(changed.into_iter().filter(|&s| s % parts != part));
         slots
     } else {
         changed
@@ -1435,7 +1459,6 @@ impl State {
 
     /// As [`State::prepare`], for draws (`mesh` false) or mesh dispatches.
     fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
-        #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             return false;
         }
@@ -1611,6 +1634,36 @@ impl State {
             self.host_roots[usize::from(compute)] = root;
         }
         // By host object: a title pipeline released and another made at its
+/// Whether the stages of one draw share a table they both need made afresh
+/// (`VICTORY_TABLE_STAGES=0` disables; on by default).
+/// Cuts duplicate dynamic descriptor table allocations & CBV copies across VS/MS + PS.
+fn table_stages() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TABLE_STAGES").is_none_or(|v| v != "0"))
+}
+
+/// Per root table the stages of `p` read: `(slot, max_slots_with_cbv, max_slots_all)`.
+fn stage_spans(p: &HostPipeline) -> Few<(u8, u32, u32), 16> {
+    let mut spans: Few<(u8, u32, u32), 16> = Few::default();
+    if p.stages.len() < 2 {
+        return spans;
+    }
+    for stage in &p.stages {
+        let t = stage.translated();
+        for group in &t.tables.groups {
+            let n = group.max_dword / 8 + 1;
+            let with = if group.has_cbv { n } else { 0 };
+            if let Some(s) = spans.iter_mut().find(|s| s.0 == group.slot) {
+                s.1 = s.1.max(with);
+                s.2 = s.2.max(n);
+            } else {
+                spans.push((group.slot, with, n));
+            }
+        }
+    }
+    spans
+}
+
         // address is another host pipeline (the list keeps the old one).
         if self.host_pipeline != p.pso.as_raw() as usize {
             // SAFETY: an open list and a live pipeline.
@@ -1619,13 +1672,14 @@ impl State {
             // The title may release the pipeline before it submits the list.
             list.bind_pipeline(&p.name, &p.pso, &p.root);
         }
+        let spans = if table_stages() { stage_spans(p) } else { Few::default() };
         for stage in &p.stages {
             let t = stage.translated();
             STORES.set(t.stores);
             if t.stores && crate::picked::on() && crate::picked::picks(&stage.shader, &t.picks) {
                 crate::picked::runs_in(list);
             }
-            let made = self.tables(list, &t.tables, compute);
+            let made = self.tables(list, &t.tables, compute, &spans);
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
@@ -2795,9 +2849,9 @@ impl State {
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32, flags: u32) {
         // It may write the arguments a window holds clamped.
         self.window = None;
-        #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
             return;
         }
@@ -3407,6 +3461,7 @@ impl State {
         list: &HostList,
         plan: &TablePlan,
         compute: bool,
+        spans: &[(u8, u32, u32)],
     ) -> Few<(u8, u32), 16> {
         let mut fresh = [0u64; 4];
         let selected_slot = |mask: &[u64; 4], slot: u8| mask[usize::from(slot / 64)] & (1u64 << (slot % 64)) != 0;
@@ -3466,6 +3521,15 @@ impl State {
             selected.sort_unstable();
             selected.dedup();
             let n = (group.max_dword / 8).max(selected.last().copied().unwrap_or(0)) + 1;
+            let n = match spans.iter().find(|s| s.0 == slot) {
+                Some(&(_, with_constants, all)) => {
+                    let past = heap
+                        .index(table)
+                        .is_some_and(|at| u64::from(at) + u64::from(all) > u64::from(host.count()));
+                    n.max(if past { all } else { with_constants })
+                }
+                None => n,
+            };
             let last = table.checked_add(u64::from(n - 1) * 32);
             if n > crate::descriptor::host::DYNAMIC
                 || last.and_then(|handle| heap.index(handle)).is_none()
@@ -3542,7 +3606,15 @@ impl State {
                 made.push((slot, u32::MAX));
                 continue;
             };
-            self.fresh_tables.insert(key, FreshTable { first, epoch: 0, ready: Vec::new() });
+            self.fresh_tables.insert(
+                key,
+                FreshTable {
+                    first,
+                    epoch: 0,
+                    ready: Vec::new(),
+                    cbvs: Vec::new(),
+                },
+            );
             self.dynamic
                 .push((std::ptr::from_ref(heap) as usize, first, n));
             // The title's own slots of this table: what the draw reads of
@@ -3562,6 +3634,7 @@ impl State {
                 self.recording = NEXT.fetch_add(1, Ordering::Relaxed);
             }
             let recording = self.recording;
+            let mut cbvs: Vec<(usize, usize)> = Vec::new();
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             for k in 0..n {
@@ -3611,6 +3684,7 @@ impl State {
                 let used = group.entry(k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
+                        cbvs.push((address as usize, (address as usize).saturating_add(size as usize)));
                         // Renderer port 5: title memory in place is the
                         // card's to read where it is; nothing is copied.
                         if crate::port_cbv::in_place_on() {
@@ -3625,13 +3699,17 @@ impl State {
                                 None => crate::port_cbv::copied(true),
                             }
                         }
-                        let Some((buffer, gpu, to)) = list.scratch_held(u64::from(size)) else {
-                            host.make_null(index);
-                            continue;
-                        };
-                        let slot = (std::ptr::from_ref(heap) as usize, index);
-                        list.defer_constants(to, address as *const u8, size as usize, slot);
-                        host.constant_at(index, &buffer, gpu, size);
+                        if let Some((buffer, gpu)) = list.place_constants(address, size) {
+                            host.constant_at(index, &buffer, gpu, size);
+                        } else {
+                            let Some((buffer, gpu, to)) = list.scratch_held(u64::from(size)) else {
+                                host.make_null(index);
+                                continue;
+                            };
+                            let slot = (std::ptr::from_ref(heap) as usize, index);
+                            list.defer_constants(to, address as *const u8, size as usize, slot);
+                            host.constant_at(index, &buffer, gpu, size);
+                        }
                     }
                     Some(view) => {
                         host.make_at(index, &view);
@@ -3662,6 +3740,11 @@ impl State {
                         }
                     }
                 }
+            }
+            if !cbvs.is_empty()
+                && let Some(ft) = self.fresh_tables.get_mut(&key)
+            {
+                ft.cbvs = cbvs;
             }
             made.push((slot, first * 32));
         }
@@ -3903,10 +3986,14 @@ impl State {
         }
     }
 
-    /// A buffer was copied to: what was clamped of it ahead is clamped anew.
-    pub(crate) fn copied(&mut self) {
+    /// A buffer was copied to: what was clamped of it ahead is clamped anew,
+    /// and any cached table holding an overlapping constant view is invalidated.
+    pub(crate) fn copied(&mut self, dst: usize, len: usize) {
         self.window = None;
         self.batch = None;
+        let end = dst.saturating_add(len);
+        self.fresh_tables
+            .retain(|_, ft| !ft.cbvs.iter().any(|&(a, e)| a < end && e > dst));
     }
 
     /// The title waits for earlier work (a barrier or a pipeline sync).
@@ -3965,8 +4052,8 @@ impl State {
         count: Option<u64>,
     ) -> bool {
         // Skip before the argument clamp can mutate the indirect buffer.
-        #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
+            #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
             return false;
         }
@@ -4350,6 +4437,7 @@ struct FreshTable {
     /// tested depth target.
     epoch: u64,
     ready: Vec<((usize, usize, bool, usize), bool)>,
+    cbvs: Vec<(usize, usize)>,
 }
 
 /// Whether a table a list reads again, with nothing changed in the list

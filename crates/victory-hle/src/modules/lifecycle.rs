@@ -226,6 +226,23 @@ fn fit_into(area: &RECT, width: i32, height: i32) -> (i32, i32) {
     )
 }
 
+/// Whether client-area mouse look is captured and the host cursor should stay hidden.
+static CURSOR_HIDDEN: AtomicBool = AtomicBool::new(false);
+
+#[allow(dead_code)]
+pub(crate) fn set_cursor_hidden(hidden: bool) {
+    CURSOR_HIDDEN.store(hidden, Ordering::Relaxed);
+}
+
+fn arrow_cursor() -> wm::HCURSOR {
+    static ARROW: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    // SAFETY: standard shared system arrow cursor handle (never destroyed).
+    let raw = *ARROW.get_or_init(|| unsafe {
+        wm::LoadCursorW(std::ptr::null_mut(), wm::IDC_ARROW) as usize
+    });
+    raw as wm::HCURSOR
+}
+
 /// Puts our procedure in front of the title's.
 fn hook(hwnd: HWND) {
     if hwnd.is_null() {
@@ -260,6 +277,20 @@ extern "system" fn window_proc(
     // menu. The mouse still opens it from the title bar.
     if message == wm::WM_SYSCOMMAND && wparam & 0xFFF0 == wm::SC_KEYMENU as usize {
         return 0;
+    }
+    // Console titles register WNDCLASS with hCursor = NULL and ignore WM_SETCURSOR,
+    // leaving Windows' launch/busy blue spinner stuck over the client area.
+    // Set the clean arrow cursor (or hide it when requested) for client hit tests,
+    // leaving borders/caption to default handling.
+    if message == wm::WM_SETCURSOR && ((lparam as usize) & 0xFFFF) == wm::HTCLIENT as usize {
+        let cursor = if CURSOR_HIDDEN.load(Ordering::Relaxed) {
+            std::ptr::null_mut()
+        } else {
+            arrow_cursor()
+        };
+        // SAFETY: standard Win32 cursor update on the window's thread.
+        unsafe { wm::SetCursor(cursor) };
+        return 1;
     }
     // SAFETY: the procedure `hook` stored, called the way the system would.
     unsafe {
@@ -563,6 +594,8 @@ mod tests {
     thread_local! {
         /// The system commands `recording` received, low four bits cleared.
         static COMMANDS: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+        /// The `WM_SETCURSOR` hit-test codes that reached the title's procedure.
+        static CURSORS: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
     }
 
     /// Stands in for a title's procedure: notes system commands and acts
@@ -575,6 +608,10 @@ mod tests {
     ) -> LRESULT {
         if message == wm::WM_SYSCOMMAND {
             COMMANDS.with(|c| c.borrow_mut().push(wparam & 0xFFF0));
+            return 0;
+        }
+        if message == wm::WM_SETCURSOR {
+            CURSORS.with(|c| c.borrow_mut().push((lparam as usize) & 0xFFFF));
             return 0;
         }
         // SAFETY: the system's default procedure, called as the system would.
@@ -618,5 +655,49 @@ mod tests {
         }
         let seen = COMMANDS.with(|c| c.borrow().clone());
         assert_eq!(seen, [wm::SC_MINIMIZE as usize]);
+    }
+
+    #[test]
+    fn client_setcursor_uses_host_arrow_and_skips_title_procedure() {
+        let null = std::ptr::null_mut();
+        let hwnd = CreateWindowExW(
+            0,
+            w!("STATIC"),
+            w!("cursor"),
+            0,
+            0,
+            0,
+            10,
+            10,
+            null,
+            null,
+            null,
+            std::ptr::null(),
+        );
+        assert!(!hwnd.is_null());
+        // SAFETY: our window on this thread; `recording` stands in for the title's procedure.
+        let client_res = unsafe {
+            let title = wm::GetPropW(hwnd, TITLE_PROC);
+            wm::SetPropW(hwnd, TITLE_PROC, recording as *const () as *mut c_void);
+            CURSORS.with(|c| c.borrow_mut().clear());
+            let r = wm::SendMessageW(
+                hwnd,
+                wm::WM_SETCURSOR,
+                hwnd as usize,
+                LPARAM::from(wm::HTCLIENT as isize),
+            );
+            wm::SendMessageW(
+                hwnd,
+                wm::WM_SETCURSOR,
+                hwnd as usize,
+                LPARAM::from(wm::HTCAPTION as isize),
+            );
+            wm::SetPropW(hwnd, TITLE_PROC, title);
+            wm::DestroyWindow(hwnd);
+            r
+        };
+        assert_eq!(client_res, 1);
+        let seen = CURSORS.with(|c| c.borrow().clone());
+        assert_eq!(seen, [wm::HTCAPTION as usize]);
     }
 }

@@ -67,6 +67,7 @@ pub(crate) struct Staging {
     /// The title texture's shape, for `crate::texstore`.
     shape: crate::texstore::Shape,
     memory: *const u8,
+    guard_view: bool,
     last: Mutex<Last>,
     /// Whether the staging buffer was detiled since a submitted list last
     /// uploaded it, and whether one has uploaded it at all: a list records
@@ -795,7 +796,7 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     // at submission is left, and what it finds changed the next list that
     // samples the texture uploads (a frame late where every list of the
     // frame was recorded before that check).
-    if staging.uploaded.load(Relaxed) && !staging.dirty.load(Relaxed) {
+    if staging.guard_view && staging.uploaded.load(Relaxed) && !staging.dirty.load(Relaxed) {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexSkipped, 1);
         list.defer_texture(staging);
@@ -1277,6 +1278,7 @@ impl Staging {
         // The guard saw no write: a change the hash finds came another way.
         let mut blind = false;
         if !alone
+            && self.guard_view
             && *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
             && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
         {
@@ -1869,6 +1871,13 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
     let host = host()?;
     // SAFETY: a live resource.
     let d = unsafe { texture.GetDesc() };
+    static PLANES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let guard_view = !(*PLANES.get_or_init(|| std::env::var_os("VICTORY_VIDEO_PLANES").is_none_or(|v| v != "0"))
+        && d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        && d.Format == windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8_UNORM
+        && d.MipLevels == 1
+        && d.DepthOrArraySize == 1
+        && layout.desc.swizzle == victory_formats::texture::Swizzle::LINEAR);
     let level0 = copy.base;
     let mips = level0 + u32::from(d.MipLevels);
     let first = crate::resource::read_from(&layout, first).max(level0).min(mips - 1);
@@ -1939,6 +1948,7 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
         bytes: total,
         shape: desc.shape(),
         memory,
+        guard_view,
         last: Mutex::default(),
         dirty: std::sync::atomic::AtomicBool::new(true),
         uploaded: std::sync::atomic::AtomicBool::new(false),

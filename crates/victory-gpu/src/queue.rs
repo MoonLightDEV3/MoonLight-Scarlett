@@ -644,6 +644,9 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     }
 }
 
+/// Stride in bytes between consecutive `D3D12XBOX_PRESENT_PLANE_PARAMETERS`
+/// entries when `PresentX` submits more than one plane.
+#[cfg(windows)]
 /// The start of a present plane: frame token, then the plane's resources.
 #[repr(C)]
 pub(crate) struct Plane {
@@ -1114,7 +1117,7 @@ fn show_planes(
     #[cfg(feature = "diagnostics")]
     blinks(what.frame, what.resource as This, state, shown);
     #[cfg(not(feature = "diagnostics"))]
-    let _ = (shown, what.resource);
+    let _ = (shown, what.resource, state);
 }
 
 /// Diagnostics: logs a presented frame that is black after one that was

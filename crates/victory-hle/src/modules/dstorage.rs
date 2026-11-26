@@ -599,6 +599,31 @@ struct Job {
 // SAFETY: as for `Lane`.
 unsafe impl Send for Job {}
 
+/// Resolves the DirectStorage worker count (`VICTORY_DSTORAGE_WORKERS`),
+/// clamped to `1..=available_cores`. Defaults to all available logical cores
+/// unless capped for laptop CPU/UI responsiveness.
+fn dstorage_worker_count(asked: Option<&str>, available: usize) -> usize {
+    let max_workers = available.max(1);
+    match asked.and_then(|v| v.trim().parse::<usize>().ok()) {
+        Some(n) => n.clamp(1, max_workers),
+        None => max_workers,
+    }
+}
+
+/// Lowers the current thread priority to `BELOW_NORMAL` when
+/// `VICTORY_DSTORAGE_LOW_PRIORITY=1`, keeping Windows DWM and game threads responsive
+/// during heavy archive decompression.
+fn apply_dstorage_worker_priority() {
+    #[cfg(windows)]
+    if std::env::var_os("VICTORY_DSTORAGE_LOW_PRIORITY").is_some_and(|v| v == "1") {
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL,
+        };
+        // SAFETY: sets priority on the calling worker thread.
+        unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL) };
+    }
+}
+
 /// The scheduler, with its workers started on first use; `None` if not
 /// even one worker could start.
 fn scheduler() -> Option<&'static Scheduler> {
@@ -628,12 +653,19 @@ fn scheduler() -> Option<&'static Scheduler> {
         })
         .as_ref()?;
     STARTED.call_once(|| {
-        let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let available = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let workers = dstorage_worker_count(
+            std::env::var("VICTORY_DSTORAGE_WORKERS").ok().as_deref(),
+            available,
+        );
         let started = (0..workers)
             .filter(|i| {
                 std::thread::Builder::new()
                     .name(format!("dstorage {i}"))
-                    .spawn(|| work(scheduler))
+                    .spawn(|| {
+                        apply_dstorage_worker_priority();
+                        work(scheduler);
+                    })
                     .is_ok()
             })
             .count();
@@ -2550,5 +2582,14 @@ mod tests {
         assert_eq!(inflate(&bad_body, &mut out), Err(INVALID_DATA));
         assert_eq!(inflate(&packed, &mut out), Ok(plain.len()));
         assert_eq!(out, plain);
+    }
+
+    #[test]
+    fn dstorage_worker_count_clamps_and_defaults() {
+        assert_eq!(dstorage_worker_count(None, 20), 20);
+        assert_eq!(dstorage_worker_count(Some("6"), 20), 6);
+        assert_eq!(dstorage_worker_count(Some(" 0 "), 20), 1);
+        assert_eq!(dstorage_worker_count(Some("99"), 20), 20);
+        assert_eq!(dstorage_worker_count(Some("invalid"), 12), 12);
     }
 }

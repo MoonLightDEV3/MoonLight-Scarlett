@@ -66,6 +66,7 @@ pub(super) struct Front {
     words: Vec<u64>,
     closed: bool,
     submitted: bool,
+    dirty: bool,
 }
 
 impl Drop for Front {
@@ -84,6 +85,7 @@ impl Front {
             recording.abandoned.store(true, Release);
         }
         self.words.clear();
+        self.dirty = false;
     }
 
     /// Begins a recording, with `pipeline` bound.
@@ -92,6 +94,7 @@ impl Front {
         self.recording = Some(Arc::new(Recording::new(kind)));
         self.closed = false;
         self.submitted = false;
+        self.dirty = false;
         self.put(RESET, &[pipeline as u64]);
     }
 
@@ -99,6 +102,9 @@ impl Front {
     fn put(&mut self, op: u64, args: &[u64]) {
         if self.closed || self.recording.is_none() {
             return;
+        }
+        if op != RESET && op != CLOSE {
+            self.dirty = true;
         }
         self.words.push(op | (args.len() as u64) << 16);
         self.words.extend_from_slice(args);
@@ -111,6 +117,9 @@ impl Front {
     fn put_with(&mut self, op: u64, args: &[u64], blobs: &[&[u8]]) {
         if self.closed || self.recording.is_none() {
             return;
+        }
+        if op != RESET && op != CLOSE {
+            self.dirty = true;
         }
         let at = self.words.len();
         self.words.push(0);
@@ -151,6 +160,12 @@ impl Front {
 
     fn close(&mut self) {
         if self.closed {
+            return;
+        }
+        if !self.dirty {
+            self.closed = true;
+            self.recording = None;
+            self.words.clear();
             return;
         }
         self.put(CLOSE, &[]);
@@ -272,7 +287,19 @@ impl Drop for Recording {
                 STATS[3].fetch_add(1, Relaxed);
                 super::close(inner.back as This);
             }
-            held(&BACKS).push(inner.back);
+            let cap = super::idle_most().0;
+            let mut backs = held(&BACKS);
+            if backs.len() < cap {
+                backs.push(inner.back);
+            } else {
+                drop(backs);
+                // SAFETY: `inner.back` came from `Box::into_raw(super::boxed(...))`
+                // and no other owner references it once this `Recording` drops.
+                let mut back = unsafe { Box::from_raw(inner.back as *mut List) };
+                if let Some(host) = back.host.take() {
+                    super::recycle_unused(host);
+                }
+            }
         }
     }
 }
@@ -294,7 +321,9 @@ fn back_list(kind: u32) -> This {
         unsafe { (*(back as *mut List)).kind = kind };
         return back as This;
     }
-    let list: This = Box::into_raw(super::boxed(kind, std::ptr::null(), false)).cast_const().cast();
+    let list: This = Box::into_raw(super::boxed(kind, std::ptr::null(), false, false))
+        .cast_const()
+        .cast();
     super::close(list);
     list
 }
@@ -490,6 +519,17 @@ fn at_or<T>(w: &[u64], from: usize) -> *const T {
     unsafe { w.as_ptr().add(from.min(w.len())).cast() }
 }
 
+/// `count` items copied into `w` starting at `from`.
+fn slice_at<T>(w: &[u64], from: usize, count: usize) -> &[T] {
+    let ptr: *const T = at(w, from, count);
+    if ptr.is_null() || count == 0 {
+        &[]
+    } else {
+        // SAFETY: `count` items were copied into the stream at `from`.
+        unsafe { std::slice::from_raw_parts(ptr, count) }
+    }
+}
+
 /// A view's record as it is now (zeros for no view), so that its slot may be
 /// written again: the copy stands for the handle.
 fn record(handle: u64) -> [u64; RECORD] {
@@ -547,8 +587,10 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
     }
     0
 }
-extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
-    front(this).put(BARRIER_GROUPS, &[u64::from(count)]);
+extern "system" fn barrier_groups(this: This, count: u32, groups: *const u8) {
+    if super::barrier_groups_need_uav(count, groups) {
+        front(this).put(BARRIER_GROUPS, &[u64::from(count)]);
+    }
 }
 extern "system" fn viewports(this: This, count: u32, items: *const D3D12_VIEWPORT) {
     let count = if items.is_null() { 0 } else { count };
@@ -678,11 +720,64 @@ extern "system" fn copy_texture_region_x(
     copy_texture_region(this, dst, x, y, z, src, source_box);
 }
 
+struct HeldState<'a> {
+    list: &'a crate::host::HostList,
+    state: std::sync::MutexGuard<'a, crate::draw::State>,
+    #[cfg(feature = "diagnostics")]
+    started: std::time::Instant,
+    #[cfg(feature = "diagnostics")]
+    calls: u64,
+}
+
+impl Drop for HeldState<'_> {
+    fn drop(&mut self) {
+        #[cfg(feature = "diagnostics")]
+        if self.calls > 0 {
+            crate::copystat::recorded(self.started);
+            if self.calls > 1 {
+                crate::copystat::add(crate::copystat::C::RecordCalls, self.calls - 1);
+            }
+        }
+    }
+}
+
 /// Makes the calls of a stream on `list`: how many, and whether the last one
 /// closed it. Once `left` says so only what must not be lost is done.
+/// Holds `List::state`'s lock across consecutive state/draw calls inside the
+/// chunk and releases it immediately before any `super::*` call.
 fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool) {
+    let mut held_state: Option<HeldState<'_>> = None;
+    macro_rules! with_held {
+        ($l:ident, $s:ident => $body:expr) => {{
+            let entry = match &mut held_state {
+                Some(entry) => Some(entry),
+                None => super::host_list(list).map(|host| {
+                    // SAFETY: `list` is a `List` owned exclusively by this recording chunk.
+                    let state = unsafe { &(*list.cast::<List>()).state };
+                    held_state.insert(HeldState {
+                        list: host,
+                        state: state.lock().unwrap_or_else(|e| e.into_inner()),
+                        #[cfg(feature = "diagnostics")]
+                        started: std::time::Instant::now(),
+                        #[cfg(feature = "diagnostics")]
+                        calls: 0,
+                    })
+                }),
+            };
+            if let Some(entry) = entry {
+                #[cfg(feature = "diagnostics")]
+                {
+                    entry.calls += 1;
+                }
+                let ($l, $s) = (entry.list, &mut *entry.state);
+                $body
+            }
+        }};
+    }
+
     let (mut i, mut calls, mut closed) = (0, 0, false);
     let mut skip = left();
+    let mut last_uav_barrier = false;
     while i < stream.len() {
         let (op, len) = (stream[i] & 0xffff, (stream[i] >> 16) as usize);
         let w = &stream[i + 1..i + 1 + len];
@@ -702,40 +797,117 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
         if skip && op != CLOSE && op != RESET {
             continue;
         }
-        if run_plain(op, list, w) {
-            continue;
-        }
-        let n = w.first().map_or(0, |&n| n as usize);
+        let prev_uav_barrier = std::mem::replace(&mut last_uav_barrier, false);
         match op {
-            RESET => {
-                // (Only whether there is an allocator is looked at.)
-                let allocator: This = std::ptr::NonNull::<u64>::dangling().as_ptr().cast_const().cast();
-                super::reset(list, allocator, w[0] as This);
+            n if n == Plain::TOPOLOGY as u64 => with_held!(l, s => s.set_topology(l, Word::unword(w[0]))),
+            n if n == Plain::STENCIL_REF as u64 => with_held!(l, s => s.set_stencil_ref(l, Word::unword(w[0]))),
+            n if n == Plain::DEPTH_BOUNDS as u64 => {
+                with_held!(l, s => s.set_depth_bounds(l, Word::unword(w[0]), Word::unword(w[1])));
             }
-            CLOSE => {
-                super::close(list);
-                closed = true;
+            n if n == Plain::COMPUTE_TABLE as u64 => {
+                with_held!(_l, s => s.set_table(true, Word::unword(w[0]), Word::unword(w[1])));
             }
-            BARRIER => {
-                super::barrier(list, n as u32, at_or(w, 1));
+            n if n == Plain::GRAPHICS_TABLE as u64 => {
+                with_held!(_l, s => s.set_table(false, Word::unword(w[0]), Word::unword(w[1])));
             }
-            BARRIER_GROUPS => super::barrier_groups(list, n as u32, std::ptr::null()),
-            VIEWPORTS => state::viewports(list, n as u32, at(w, 1, n)),
-            SCISSORS => state::scissors(list, n as u32, at(w, 1, n)),
-            BLEND_FACTOR => state::blend_factor(list, at(w, 1, n)),
-            HEAPS => state::heaps(list, n as u32, at(w, 1, n)),
+            n if n == Plain::COMPUTE_CONSTANT as u64 => {
+                with_held!(_l, s => {
+                    let v: u32 = Word::unword(w[1]);
+                    s.set_constants(true, Word::unword(w[0]), &[v], Word::unword(w[2]));
+                });
+            }
+            n if n == Plain::GRAPHICS_CONSTANT as u64 => {
+                with_held!(_l, s => {
+                    let v: u32 = Word::unword(w[1]);
+                    s.set_constants(false, Word::unword(w[0]), &[v], Word::unword(w[2]));
+                });
+            }
+            n if n == Plain::COMPUTE_VIEW as u64 => {
+                with_held!(_l, s => s.set_view(true, Word::unword(w[0]), Word::unword(w[1])));
+            }
+            n if n == Plain::GRAPHICS_VIEW as u64 => {
+                with_held!(_l, s => s.set_view(false, Word::unword(w[0]), Word::unword(w[1])));
+            }
+            n if n == Plain::SET_PIPELINE as u64 => {
+                let pipeline: This = Word::unword(w[0]);
+                crate::pipeline::bound(pipeline);
+                with_held!(_l, s => s.set_pipeline(pipeline));
+            }
+            n if n == Plain::DRAW as u64 => {
+                super::count_draw();
+                with_held!(l, s => s.draw(l, Word::unword(w[0]), Word::unword(w[1]), Word::unword(w[2]), Word::unword(w[3])));
+            }
+            n if n == Plain::DRAW_INDEXED as u64 => {
+                super::count_draw();
+                with_held!(l, s => s.draw_indexed(l, Word::unword(w[0]), Word::unword(w[1]), Word::unword(w[2]), Word::unword(w[3]), Word::unword(w[4])));
+            }
+            n if n == Plain::DISPATCH as u64 => {
+                super::count_dispatch();
+                with_held!(l, s => s.dispatch(l, Word::unword(w[0]), Word::unword(w[1]), Word::unword(w[2]), 0));
+            }
+            n if n == Plain::DISPATCH_X as u64 => {
+                super::count_dispatch();
+                with_held!(l, s => s.dispatch(l, Word::unword(w[0]), Word::unword(w[1]), Word::unword(w[2]), Word::unword(w[3])));
+            }
+            n if n == Plain::DISPATCH_MESH as u64 => {
+                super::count_draw();
+                let (x, y, z): (u32, u32, u32) = (Word::unword(w[0]), Word::unword(w[1]), Word::unword(w[2]));
+                if y * z != 1 {
+                    static ONCE: std::sync::Once = std::sync::Once::new();
+                    ONCE.call_once(|| tracing::warn!(x, y, z, "a mesh dispatch with y or z groups"));
+                }
+                with_held!(l, s => s.dispatch_mesh(l, x));
+            }
+            n if n == Plain::DISPATCH_MESH_X as u64 => {
+                super::count_draw();
+                let (x, indirect): (u32, u64) = (Word::unword(w[0]), Word::unword(w[2]));
+                if indirect != 0 {
+                    static ONCE: std::sync::Once = std::sync::Once::new();
+                    ONCE.call_once(|| tracing::warn!("indirect mesh dispatches dropped"));
+                } else {
+                    with_held!(l, s => s.dispatch_mesh(l, x));
+                }
+            }
+            VIEWPORTS => {
+                let n = w.first().map_or(0, |&n| n as usize);
+                with_held!(l, s => s.set_viewports(l, slice_at::<D3D12_VIEWPORT>(w, 1, n)));
+            }
+            SCISSORS => {
+                let n = w.first().map_or(0, |&n| n as usize);
+                with_held!(l, s => s.set_scissors(l, slice_at::<RECT>(w, 1, n)));
+            }
+            BLEND_FACTOR => {
+                let n = w.first().map_or(0, |&n| n as usize);
+                let factor: *const [f32; 4] = at(w, 1, n);
+                // SAFETY: `factor` is four floats in `w` or null.
+                with_held!(l, s => s.set_blend_factor(l, unsafe { factor.as_ref() }));
+            }
+            HEAPS => {
+                let n = w.first().map_or(0, |&n| n as usize);
+                with_held!(_l, s => s.set_heaps(slice_at::<This>(w, 1, n)));
+            }
             COMPUTE_CONSTANTS => {
-                state::compute_constants(list, w[0] as u32, w[1] as u32, at(w, 2, w[1] as usize), (w[0] >> 32) as u32)
+                with_held!(_l, s => s.set_constants(true, w[0] as u32, slice_at::<u32>(w, 2, w[1] as usize), (w[0] >> 32) as u32));
             }
             GRAPHICS_CONSTANTS => {
-                state::graphics_constants(list, w[0] as u32, w[1] as u32, at(w, 2, w[1] as usize), (w[0] >> 32) as u32)
+                with_held!(_l, s => s.set_constants(false, w[0] as u32, slice_at::<u32>(w, 2, w[1] as usize), (w[0] >> 32) as u32));
             }
-            INDEX_BUFFER => state::index_buffer(list, at(w, 1, n)),
+            INDEX_BUFFER => {
+                let n = w.first().map_or(0, |&n| n as usize);
+                let view: *const IndexView = at(w, 1, n);
+                // SAFETY: `view` is an `IndexView` in `w` or null.
+                with_held!(_l, s => s.set_index_buffer(unsafe { view.as_ref() }));
+            }
             VERTEX_BUFFERS => {
-                let views = if w[1] != 0 { at_or(w, 2) } else { std::ptr::null() };
-                state::vertex_buffers(list, w[0] as u32, (w[0] >> 32) as u32, views);
+                let (start, count) = (w[0] as u32, (w[0] >> 32) as u32);
+                if w[1] != 0 {
+                    with_held!(_l, s => s.set_vertex_buffers(start, slice_at::<VertexView>(w, 2, count as usize)));
+                } else {
+                    with_held!(_l, s => s.clear_vertex_buffers(start, count));
+                }
             }
             TARGETS => {
+                let n = w.first().map_or(0, |&n| (n as usize).min(8));
                 let mut handles = [0u64; 8];
                 let place = |k: usize| w[3 + k * RECORD..].as_ptr() as u64;
                 for (k, h) in handles.iter_mut().enumerate().take(n) {
@@ -744,42 +916,71 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
                     }
                 }
                 let depth = if w[2] != 0 { place(n) } else { 0 };
-                state::targets(list, n as u32, handles.as_ptr(), 0, &depth);
+                with_held!(l, s => s.set_targets(l, &handles[..n], depth));
             }
-            CLEAR_RTV => {
-                super::clear_rtv(
-                    list,
-                    w[1..].as_ptr() as u64,
-                    at_or(w, 1 + RECORD),
-                    n as u32,
-                    at(w, 1 + RECORD + 2, n),
-                );
+            _ => {
+                held_state = None;
+                if run_plain(op, list, w) {
+                    continue;
+                }
+                let n = w.first().map_or(0, |&n| n as usize);
+                match op {
+                    RESET => {
+                        // (Only whether there is an allocator is looked at.)
+                        let allocator: This = std::ptr::NonNull::<u64>::dangling().as_ptr().cast_const().cast();
+                        super::reset(list, allocator, w[0] as This);
+                    }
+                    CLOSE => {
+                        super::close(list);
+                        closed = true;
+                    }
+                    BARRIER => {
+                        super::barrier(list, n as u32, at_or(w, 1));
+                    }
+                    BARRIER_GROUPS => {
+                        if n > 0 {
+                            if !prev_uav_barrier {
+                                super::barrier_groups(list, n as u32, std::ptr::null());
+                            }
+                            last_uav_barrier = true;
+                        }
+                    }
+                    CLEAR_RTV => {
+                        super::clear_rtv(
+                            list,
+                            w[1..].as_ptr() as u64,
+                            at_or(w, 1 + RECORD),
+                            n as u32,
+                            at(w, 1 + RECORD + 2, n),
+                        );
+                    }
+                    CLEAR_DSV => {
+                        super::clear_dsv(
+                            list,
+                            w[3..].as_ptr() as u64,
+                            w[1] as u32,
+                            Word::unword(w[2]),
+                            (w[1] >> 32) as u8,
+                            n as u32,
+                            at(w, 3 + RECORD, n),
+                        );
+                    }
+                    COPY_TEXTURE => {
+                        let step = size_of::<CopyLocation>().div_ceil(8);
+                        let boxed = (w[1] >> 32) as usize;
+                        super::copy_texture_region(
+                            list,
+                            at_or(w, 2),
+                            w[0] as u32,
+                            (w[0] >> 32) as u32,
+                            w[1] as u32,
+                            at_or(w, 2 + step),
+                            at(w, 2 + 2 * step, boxed),
+                        );
+                    }
+                    _ => {}
+                }
             }
-            CLEAR_DSV => {
-                super::clear_dsv(
-                    list,
-                    w[3..].as_ptr() as u64,
-                    w[1] as u32,
-                    Word::unword(w[2]),
-                    (w[1] >> 32) as u8,
-                    n as u32,
-                    at(w, 3 + RECORD, n),
-                );
-            }
-            COPY_TEXTURE => {
-                let step = size_of::<CopyLocation>().div_ceil(8);
-                let boxed = (w[1] >> 32) as usize;
-                super::copy_texture_region(
-                    list,
-                    at_or(w, 2),
-                    w[0] as u32,
-                    (w[0] >> 32) as u32,
-                    w[1] as u32,
-                    at_or(w, 2 + step),
-                    at(w, 2 + 2 * step, boxed),
-                );
-            }
-            _ => {}
         }
     }
     (calls, closed)
@@ -909,5 +1110,29 @@ mod tests {
         assert_eq!(slot[1], 99);
         assert_eq!(kept[1], 2);
         assert_eq!(record(0), [0; RECORD]);
+    }
+
+    /// Empty `begin -> close` lists drop their recording without queuing a
+    /// backing host list, whereas non-empty recordings hand over normally.
+    #[test]
+    fn empty_begin_close_skips_backing_list() {
+        let mut empty = Front::default();
+        empty.begin(0, std::ptr::null());
+        assert!(empty.recording.is_some());
+        assert!(!empty.dirty);
+        empty.close();
+        assert!(empty.closed);
+        assert!(empty.recording.is_none());
+        assert!(empty.words.is_empty());
+
+        let mut active = Front::default();
+        active.begin(0, std::ptr::null());
+        active.put(Plain::DRAW_INDEXED as u64, &[3, 1, 0, 0, 0]);
+        assert!(active.dirty);
+        let rec = active.recording.clone().unwrap();
+        active.close();
+        assert!(active.closed);
+        assert!(active.recording.is_some());
+        held(&READY).retain(|r| !Arc::ptr_eq(r, &rec));
     }
 }

@@ -1,7 +1,7 @@
-//! `victory`: the command-line front end.
-//!
-//! Every command reads the user's own files and writes only to stdout or to
-//! the user's cache directory (outside the repository).
+// `victory`: the command-line front end.
+//
+// Every command reads the user's own files and writes only to stdout or to
+// the user's cache directory (outside the repository).
 
 mod census;
 mod inspect;
@@ -17,6 +17,14 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
+
+#[cfg(windows)]
+#[unsafe(no_mangle)]
+pub static NvOptimusEnablement: u32 = 1;
+
+#[cfg(windows)]
+#[unsafe(no_mangle)]
+pub static AmdPowerXpressRequestHighPerformance: i32 = 1;
 
 #[derive(Parser)]
 #[command(
@@ -237,6 +245,9 @@ fn main() -> Result<()> {
             console,
             title_args,
         } => {
+            if execute {
+                apply_runtime_defaults();
+            }
             victory_hle::runtime::set_title_args(title_args);
             run::run(&exe, unimplemented, strict, execute, console)
         }
@@ -244,6 +255,101 @@ fn main() -> Result<()> {
         Command::Replay(options) => replay::run(options),
         Command::Config => show_config(),
     }
+}
+
+/// Applies the hybrid VIctory-7900XTX CPU/GI + RTX 5060 8 GB VRAM / 16 GB RAM
+/// laptop-safe defaults for any environment variable the user has not explicitly overridden.
+fn apply_runtime_defaults() {
+    let set_default = |key: &str, val: &str| {
+        if std::env::var_os(key).is_none() {
+            // SAFETY: called during single-threaded CLI startup before worker threads spawn.
+            unsafe { std::env::set_var(key, val) };
+        }
+    };
+    // CPU Engine (7900XTX): thin list recording + parallel translation, async submit/present,
+    // AVX2 landing, GPU card steps (without saturating laptop compute queue or DWM).
+    set_default("VICTORY_THIN", "1");
+    set_default("VICTORY_THIN_THREADS", "6");
+    set_default("VICTORY_FAST_CORES", "2");
+    set_default("VICTORY_LANE_CORE", "1");
+    set_default("VICTORY_UP_QUEUE", "0");
+    set_default("VICTORY_WAIT_RESIDENT", "0");
+    set_default("VICTORY_JOIN_PARTS", "8");
+    set_default("VICTORY_RELAY", "2");
+    set_default("VICTORY_WIDE_BACK", "1");
+    set_default("VICTORY_WIDE_SPIN", "80");
+    set_default("VICTORY_LAND_SKIP", "1");
+    set_default("VICTORY_LAND_THREADS", "6");
+    set_default("VICTORY_RELAY_COPY", "1");
+    set_default("VICTORY_CARD_STEPS", "2");
+    set_default("VICTORY_PLACED_ORDER", "1");
+    set_default("VICTORY_JOIN_BARRIERS", "1");
+    set_default("VICTORY_CARD_REHASH_RUNS", "1");
+    set_default("VICTORY_JOIN_COPIES", "1");
+    set_default("VICTORY_INDIRECT_WINDOW", "1");
+    set_default("VICTORY_INDIRECT_BATCH", "2");
+    set_default("VICTORY_MAP_THREADS", "1");
+    // Renderer port #2 (hooks 6 descriptor table stores in the title executable;
+    // cuts heap-sync wait 9.8 -> 4.7 ms) + unguarded memcpy/store bypass (cuts RO blocks & RAM).
+    set_default("VICTORY_PORT_DESCRIPTORS", "1");
+    set_default("VICTORY_SYNC_FINE", "1");
+    set_default("VICTORY_HEAP_SYNC_EARLY", "2");
+    set_default("VICTORY_LATE_WAIT_LISTS", "128");
+    set_default("VICTORY_PORT_GUARD", "1");
+    set_default("VICTORY_PORT_JOURNAL", "1");
+    set_default("VICTORY_COPY_BESIDE", "1");
+    set_default("VICTORY_STORE_BESIDE", "1");
+    // Anti-freeze OS/thread responsiveness on 16 GB Windows 11 laptops:
+    // keep process at Normal priority, boost title's idle streaming pager (1),
+    // and cap DirectStorage decompression to 6 low-priority threads.
+    set_default("VICTORY_PROCESS_PRIORITY", "normal");
+    set_default("VICTORY_TITLE_PRIORITIES", "1");
+    set_default("VICTORY_DSTORAGE_WORKERS", "6");
+    set_default("VICTORY_DSTORAGE_LOW_PRIORITY", "1");
+    set_default("VICTORY_CARD_AWAKE", "0");
+    set_default("VICTORY_UPLOAD_AHEAD", "1");
+    set_default("VICTORY_TEXTURE_NO_WAIT", "1");
+    // Visuals, lighting & non-black textures/skin: directional SH GI + keep-shown fallback.
+    set_default("VICTORY_AMBIENT", "0.8");
+    set_default("VICTORY_AMBIENT_AIR", "1.5");
+    set_default("VICTORY_KEEP_SHOWN", "1");
+    set_default("VICTORY_SHOW_AFTER", "1");
+    set_default("VICTORY_SKIP_PIPELINES", "none");
+    set_default("VICTORY_OWN_UPSCALER", "1");
+    set_default("VICTORY_BVH_MISS", "1");
+    set_default("VICTORY_SHADER_LOOP_LIMITS", "39f0e9aeb156a61c:64,8e614708143ef917:128");
+    // Disable Wave32 LDS flag-region pass (PR #4) on NVIDIA: compiling 2cc4c197ee29e291
+    // without full Wave64 LDS sync blacks out opaque lighting tiles on cinderblock walls.
+    set_default("VICTORY_LDS_FLAGS", "0");
+    // Native 1080p output + 0.50 internal scale (960x540 -> 1920x1080 TAAU) for RTX 5060 8 GB laptop.
+    set_default("VICTORY_OUTPUT", "1920x1080");
+    set_default("VICTORY_RENDER_SCALE", "0.50");
+    // Pipeline compiler: low-priority background workers to prevent PC/mouse freezes during loading.
+    set_default("VICTORY_PIPELINE_WORKERS", "3");
+    set_default("VICTORY_PIPELINE_LOWEST", "1");
+    // 16 GB RAM / 8 GB VRAM Laptop Memory Caps (prevents shared PC RAM spill & OOM freeze,
+    // bounds HostList retention via shorter bury lag + matched pool cap, disables DRED book bloat).
+    set_default("VICTORY_KEEP_FREED", "0");
+    set_default("VICTORY_RIPE_BLOCKS", "0");
+    set_default("VICTORY_BURY_LAG", "12");
+    set_default("VICTORY_LIST_POOL_MAX", "512");
+    set_default("VICTORY_WINDOWS_BAR_MB", "1024");
+    set_default("VICTORY_WINDOW_KB", "128");
+    set_default("VICTORY_WINDOW_TAILS", "1");
+    set_default("VICTORY_CARD_BUFFERS_MIN_KB", "64");
+    set_default("VICTORY_CARD_BUFFERS_MB", "1280");
+    set_default("VICTORY_CARD_ROOM_FOR_TARGETS_MB", "1024");
+    set_default("VICTORY_TEXTURE_BUDGET_MB", "1024");
+    // Keep 4 KiB sub-64 KiB texture packing to avoid 3.3x VRAM bloat on 8 GB GPUs.
+    set_default("VICTORY_POOL_SMALL", "1");
+    set_default("VICTORY_TEXTURE_ROOM_PERCENT", "80");
+    set_default("VICTORY_TEXTURE_STAGE_MB", "32");
+    set_default("VICTORY_TEXTURE_KEEP", "0");
+    set_default("VICTORY_INPLACE", "0");
+    set_default("VICTORY_SHADER_LOOP_LIMIT", "4096");
+    set_default("VICTORY_DISPLAY_MODE", "1920x1080");
+    set_default("VICTORY_PLANE_OUT", "base");
+    set_default("VICTORY_D3D12_DRED", "0");
 }
 
 fn show_config() -> Result<()> {

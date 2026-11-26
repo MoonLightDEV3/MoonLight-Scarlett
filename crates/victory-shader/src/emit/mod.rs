@@ -149,6 +149,27 @@ pub fn loop_limit() -> u32 {
     })
 }
 
+thread_local! {
+    static LIMIT_HERE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// Runs `f` on this thread with a per-shader loop iteration limit override.
+pub fn with_loop_limit<R>(limit: u32, f: impl FnOnce() -> R) -> R {
+    struct Reset(Option<u32>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            LIMIT_HERE.with(|cell| cell.set(self.0));
+        }
+    }
+    let prev = LIMIT_HERE.with(|cell| cell.replace(Some(limit.max(1))));
+    let _reset = Reset(prev);
+    f()
+}
+
+pub(crate) fn loop_limit_here() -> u32 {
+    LIMIT_HERE.with(|cell| cell.get()).unwrap_or_else(loop_limit)
+}
+
 /// Whether a pixel shader's helper lane reads its own value where the console reads the first
 /// lane's (`lower.rs` `first_lane`); on unless `VICTORY_HELPER_OWN=0`. Part of the translation:
 /// the shader cache keys on it.

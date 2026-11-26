@@ -5,7 +5,9 @@
 //! writes it (view creation and descriptor copies) and again when a draw
 //! reads it through a table and finds the slot changed.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering::Relaxed};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -124,11 +126,285 @@ impl Made {
     }
 }
 
+struct Pool {
+    taken: Vec<bool>,
+    at: BTreeMap<usize, usize>,
+    by_len: BTreeMap<usize, BTreeSet<usize>>,
+    free: usize,
+}
+
+impl Pool {
+    fn new(len: usize) -> Self {
+        let mut at = BTreeMap::new();
+        let mut by_len = BTreeMap::new();
+        if len > 0 {
+            at.insert(0, len);
+            by_len.entry(len).or_insert_with(BTreeSet::new).insert(0);
+        }
+        Pool {
+            taken: vec![false; len],
+            at,
+            by_len,
+            free: len,
+        }
+    }
+
+    fn remove_run(&mut self, start: usize, len: usize) {
+        self.at.remove(&start);
+        if let Some(starts) = self.by_len.get_mut(&len) {
+            starts.remove(&start);
+            if starts.is_empty() {
+                self.by_len.remove(&len);
+            }
+        }
+    }
+
+    fn insert_run(&mut self, mut start: usize, mut len: usize) {
+        if len == 0 {
+            return;
+        }
+        if let Some((&prev_start, &prev_len)) = self.at.range(..start).next_back()
+            && prev_start + prev_len == start
+        {
+            self.remove_run(prev_start, prev_len);
+            start = prev_start;
+            len += prev_len;
+        }
+        let next_start = start + len;
+        if let Some(&next_len) = self.at.get(&next_start) {
+            self.remove_run(next_start, next_len);
+            len += next_len;
+        }
+        self.at.insert(start, len);
+        self.by_len.entry(len).or_default().insert(start);
+    }
+
+    fn take(&mut self, n: usize) -> Option<usize> {
+        let (&run_len, &start) = self.by_len.range(n..).next().and_then(|(l, s)| s.first().map(|st| (l, st)))?;
+        self.remove_run(start, run_len);
+        if run_len > n {
+            self.insert_run(start + n, run_len - n);
+        }
+        self.taken[start..start + n].fill(true);
+        self.free -= n;
+        Some(start)
+    }
+
+    fn take_at(&mut self, start: usize, len: usize) {
+        let (&run_start, &run_len) = self.at.range(..=start).next_back().expect("free run at start");
+        debug_assert!(run_start + run_len >= start + len);
+        self.remove_run(run_start, run_len);
+        if start > run_start {
+            self.insert_run(run_start, start - run_start);
+        }
+        let tail = run_start + run_len - (start + len);
+        if tail > 0 {
+            self.insert_run(start + len, tail);
+        }
+        self.taken[start..start + len].fill(true);
+        self.free -= len;
+    }
+
+    fn tail_free(&self) -> usize {
+        self.at
+            .range(..self.taken.len())
+            .next_back()
+            .filter(|&(&s, &l)| s + l == self.taken.len())
+            .map_or(0, |(_, &l)| l)
+    }
+
+    fn head_free(&self) -> usize {
+        self.at.get(&0).copied().unwrap_or(0)
+    }
+
+    fn give(&mut self, start: usize, n: usize) -> u32 {
+        let end = (start + n).min(self.taken.len());
+        let mut freed = 0usize;
+        let mut run_start = None;
+        for i in start..end {
+            if self.taken[i] {
+                self.taken[i] = false;
+                freed += 1;
+                run_start.get_or_insert(i);
+            } else if let Some(rs) = run_start.take() {
+                self.insert_run(rs, i - rs);
+            }
+        }
+        if let Some(rs) = run_start {
+            self.insert_run(rs, end - rs);
+        }
+        self.free += freed;
+        freed as u32
+    }
+}
+
+/// 8-shard best-fit coalescing pool for dynamic descriptor table runs.
+struct Pools {
+    shards: [Mutex<Pool>; Self::SHARDS],
+    starts: [usize; Self::SHARDS],
+    ends: [usize; Self::SHARDS],
+    total: usize,
+    free: AtomicU32,
+    wide: Mutex<()>,
+}
+
+impl Pools {
+    const SHARDS: usize = 8;
+
+    fn preferred_shard() -> usize {
+        #[cfg(test)]
+        {
+            0
+        }
+        #[cfg(not(test))]
+        {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            thread_local! {
+                static SHARD: usize = NEXT.fetch_add(1, Relaxed) % Pools::SHARDS;
+            }
+            SHARD.with(|&s| s)
+        }
+    }
+
+    fn new(extra: u32) -> Self {
+        let total = extra as usize;
+        let base = total / Self::SHARDS;
+        let rem = total % Self::SHARDS;
+        let mut starts = [0usize; Self::SHARDS];
+        let mut ends = [0usize; Self::SHARDS];
+        let mut cursor = 0usize;
+        let shards = std::array::from_fn(|s| {
+            let len = base + usize::from(s < rem);
+            starts[s] = cursor;
+            cursor += len;
+            ends[s] = cursor;
+            Mutex::new(Pool::new(len))
+        });
+        Pools {
+            shards,
+            starts,
+            ends,
+            total,
+            free: AtomicU32::new(extra),
+            wide: Mutex::new(()),
+        }
+    }
+
+    fn take(&self, n: usize) -> Option<u32> {
+        if n == 0 || n > self.total || self.free.load(Relaxed) < n as u32 {
+            return None;
+        }
+        let s0 = Self::preferred_shard();
+        for k in 0..Self::SHARDS {
+            let s = (s0 + k) % Self::SHARDS;
+            let mut pool = self.shards[s].lock().unwrap_or_else(|e| e.into_inner());
+            if pool.free >= n
+                && let Some(local) = pool.take(n)
+            {
+                self.free.fetch_sub(n as u32, Relaxed);
+                return Some((self.starts[s] + local) as u32);
+            }
+        }
+        self.take_wide(n).map(|at| at as u32)
+    }
+
+    fn take_wide(&self, n: usize) -> Option<usize> {
+        let _wide = self.wide.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guards: Vec<_> = self
+            .shards
+            .iter()
+            .map(|s| s.lock().unwrap_or_else(|e| e.into_inner()))
+            .collect();
+        let mut span_start_shard = 0usize;
+        let mut span_local_start = 0usize;
+        let mut span_len = 0usize;
+        for (s, pool) in guards.iter().enumerate() {
+            let slen = pool.taken.len();
+            if slen == 0 {
+                continue;
+            }
+            if span_len == 0 {
+                let tail = pool.tail_free();
+                if tail > 0 {
+                    span_start_shard = s;
+                    span_local_start = slen - tail;
+                    span_len = tail;
+                }
+            } else {
+                let head = pool.head_free();
+                if span_len + head >= n {
+                    let mut rem = n;
+                    let global = self.starts[span_start_shard] + span_local_start;
+                    let first_take = (guards[span_start_shard].taken.len() - span_local_start).min(rem);
+                    guards[span_start_shard].take_at(span_local_start, first_take);
+                    rem -= first_take;
+                    for mid in (span_start_shard + 1)..=s {
+                        if rem == 0 {
+                            break;
+                        }
+                        let take = guards[mid].taken.len().min(rem);
+                        if take > 0 {
+                            guards[mid].take_at(0, take);
+                            rem -= take;
+                        }
+                    }
+                    self.free.fetch_sub(n as u32, Relaxed);
+                    return Some(global);
+                } else if head == slen {
+                    span_len += head;
+                } else {
+                    let tail = pool.tail_free();
+                    if tail > 0 {
+                        span_start_shard = s;
+                        span_local_start = slen - tail;
+                        span_len = tail;
+                    } else {
+                        span_len = 0;
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn give(&self, first: u32, n: u32) {
+        let start = first as usize;
+        let end = start.saturating_add(n as usize).min(self.total);
+        if start >= end {
+            return;
+        }
+        let mut freed = 0u32;
+        for s in 0..Self::SHARDS {
+            let lo = start.max(self.starts[s]);
+            let hi = end.min(self.ends[s]);
+            if lo < hi {
+                let mut pool = self.shards[s].lock().unwrap_or_else(|e| e.into_inner());
+                freed += pool.give(lo - self.starts[s], hi - lo);
+            }
+        }
+        if freed > 0 {
+            self.free.fetch_add(freed, Relaxed);
+        }
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn is_taken(&self, index: usize) -> Option<bool> {
+        for s in 0..Self::SHARDS {
+            if index >= self.starts[s] && index < self.ends[s] {
+                let pool = self.shards[s].lock().unwrap_or_else(|e| e.into_inner());
+                return pool.taken.get(index - self.starts[s]).copied();
+            }
+        }
+        None
+    }
+}
+
 pub(crate) struct HostHeap {
     pub(crate) buffer_sweep: Mutex<crate::draw::BufferSweep>,
     pub(crate) buffer_frame: std::sync::atomic::AtomicU64,
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
+    gpu: u64,
     step: u32,
     /// Slots mirroring the title's; view heaps have `dynamic` more.
     count: u32,
@@ -170,24 +446,11 @@ pub(crate) struct HostHeap {
     /// waited for most (5.6 % of their time, profile waits-1: each descriptor
     /// made for a draw takes it, and lets go of what the slot held under it).
     kept: Box<[Mutex<Option<ID3D12Resource>>]>,
-    /// Where the search for free dynamic slots starts, and which are taken
-    /// (by lists not yet reset).
-    next: Mutex<(u32, Vec<bool>)>,
-    /// How many dynamic slots are free (changed under `next`'s lock): with
-    /// fewer than a table needs, the search is not made. Once the world
-    /// had taken them all, every later table of the frame searched every
-    /// slot before it was refused.
-    free: std::sync::atomic::AtomicU32,
-    /// The shortest table that found no run of free slots since slots were
-    /// last given back (changed under `next`'s lock; `u32::MAX`: none).
-    /// Until something is given back the free runs only shrink, so a table
-    /// of that length or longer is refused without the search. Enough
-    /// slots were free, but in pieces, and every such table walked the
-    /// whole ring before it was refused: 0.33 ms each with 131,072 slots,
-    /// 1.0 s of the recording threads in a frame that refused 3,143 (run
-    /// 45), under the lock all of them need. (A free run that lies across
-    /// the place the search starts from is seen by neither.)
-    too_long: std::sync::atomic::AtomicU32,
+    /// Lock-free raw pointer mirror of `kept` so unchanged slots skip both the
+    /// mutex lock and COM `AddRef`/`Release`.
+    kept_raw: Box<[AtomicUsize]>,
+    /// Sharded best-fit pool of free dynamic slots (`count..count + dynamic`).
+    pools: Pools,
     /// View heaps: the bytes per element of the buffer view at each title
     /// slot, for shaders that pick a buffer by an index they compute
     /// (`victory_shader::emit::SLOT_STRIDES`): an upload buffer of
@@ -1371,6 +1634,13 @@ fn view_bytes() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_VIEW_BYTES").is_none_or(|v| v != "0"))
 }
 
+/// Whether structured buffer views on heaps without raw descriptor twins
+/// (`VICTORY_RAW_STRUCTURED=1`; off by default) require 16-byte alignment / exact copies.
+fn raw_structured() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RAW_STRUCTURED").is_some_and(|v| v == "1"))
+}
+
 /// The copy the buffer view of `[start, start + len)` is made on: `shadow`, the one
 /// its buffer has, or one of the view's own bytes ([`off_elements`]).
 fn view_home(
@@ -1391,7 +1661,7 @@ fn view_home(
     if stride > 0 {
         probe_view_limit();
     }
-    let has_raw_twins = victory_shader::emit::raw_views() != 0;
+    let has_raw_twins = !raw_structured() || victory_shader::emit::raw_views() != 0;
     if !off_elements(offset, stride, raw, element, has_raw_twins) {
         return shadow;
     }
@@ -1442,7 +1712,7 @@ pub(crate) fn slot_story(slot: u32) -> String {
         let mut text = if index < host.count {
             format!("title slot {index}, made from {}", host.describe_slot(index).unwrap_or_default())
         } else {
-            let taken = host.next.lock().unwrap_or_else(|e| e.into_inner()).1.get((index - host.count) as usize).copied();
+            let taken = host.pools.is_taken((index - host.count) as usize);
             format!("dynamic slot {} (taken {taken:?})", index - host.count)
         };
         if twin {
@@ -1734,6 +2004,7 @@ impl HostHeap {
             buffer_frame: std::sync::atomic::AtomicU64::new(u64::MAX),
             heap,
             cpu,
+            gpu,
             step,
             count,
             dynamic: extra,
@@ -1750,9 +2021,8 @@ impl HostHeap {
             waiting: Mutex::default(),
             away: Mutex::default(),
             kept: (0..count + extra).map(|_| Mutex::new(None)).collect(),
-            next: Mutex::new((0, vec![false; extra as usize])),
-            free: std::sync::atomic::AtomicU32::new(extra),
-            too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
+            kept_raw: (0..count + extra).map(|_| AtomicUsize::new(0)).collect(),
+            pools: Pools::new(extra),
             strides,
             buffers: Slots::new(count as usize),
             changed: Slots::new(count as usize),
@@ -1867,36 +2137,7 @@ impl HostHeap {
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::DynamicAsked, 1);
-        let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let (next, taken) = &mut *guard;
-        let enough = self.free.load(std::sync::atomic::Ordering::Relaxed) >= n
-            && n < self.too_long.load(std::sync::atomic::Ordering::Relaxed);
-        let n = n as usize;
-        // Search from `next` on, then from the start (extending past cursor by
-        // n - 1 so contiguous runs crossing the cursor are not missed).
-        let cursor = *next as usize;
-        let end = self.dynamic as usize;
-        let second_end = cursor.saturating_add(n.saturating_sub(1)).min(end);
-        let starts = (cursor..end).chain(0..second_end);
-        let mut run = 0;
-        let mut found = None;
-        let mut last = usize::MAX;
-        for at in starts.take(if enough { usize::MAX } else { 0 }) {
-            // A run cannot wrap past the end.
-            if at != last.wrapping_add(1) {
-                run = 0;
-            }
-            last = at;
-            run = if taken[at] { 0 } else { run + 1 };
-            if run == n {
-                found = Some(at + 1 - n);
-                break;
-            }
-        }
-        let Some(first) = found else {
-            if enough {
-                self.too_long.fetch_min(n as u32, std::sync::atomic::Ordering::Relaxed);
-            }
+        let Some(first) = self.pools.take(n as usize) else {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(n, "no free dynamic descriptor slots: a table is not made"));
             #[cfg(feature = "diagnostics")]
@@ -1909,10 +2150,7 @@ impl HostHeap {
         };
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::DynamicNs, started.elapsed().as_nanos() as u64);
-        taken[first..first + n].fill(true);
-        self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed);
-        *next = ((first + n) % end) as u32;
-        Some(self.count + first as u32)
+        Some(self.count + first)
     }
 
     /// The title slots this heap has host slots for; fewer than the title's
@@ -2540,7 +2778,7 @@ impl HostHeap {
         }
         self.put(index);
         self.clear_twin(index);
-        self.keep(index, None);
+        self.keep_ref(index, None);
     }
 
     /// The slots [`HostHeap::note_buffer`] found stale for slot `index`, with
@@ -2781,14 +3019,7 @@ impl HostHeap {
         let Some(at) = first.checked_sub(self.count) else {
             return;
         };
-        let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let end = (at + n).min(self.dynamic) as usize;
-        if let Some(slots) = guard.1.get_mut(at as usize..end) {
-            let given = slots.iter().filter(|taken| **taken).count() as u32;
-            self.free.fetch_add(given, std::sync::atomic::Ordering::Relaxed);
-            self.too_long.store(u32::MAX, std::sync::atomic::Ordering::Relaxed);
-            slots.fill(false);
-        }
+        self.pools.give(at, n);
     }
 
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
@@ -2848,7 +3079,7 @@ impl HostHeap {
             } else {
                 self.clear_twin(index);
             }
-            self.keep(index, made.kept.clone());
+            self.keep_ref(index, made.kept.as_ref());
             Some(made.listed)
         })
     }
@@ -2874,7 +3105,7 @@ impl HostHeap {
             self.put(index);
         }
         self.clear_twin(index);
-        self.keep(index, None);
+        self.keep_ref(index, None);
     }
 
     /// Where the raw twin of slot `index` is made.
@@ -2904,6 +3135,18 @@ impl HostHeap {
         }
     }
 
+    /// Fast-path of [`HostHeap::keep`] taking a borrowed reference so unchanged
+    /// slots skip both the mutex and COM `AddRef`/`Release`.
+    fn keep_ref(&self, index: u32, resource: Option<&ID3D12Resource>) {
+        use std::sync::atomic::Ordering::Acquire;
+        use windows::core::Interface;
+        let raw = resource.map_or(0, |r| r.as_raw() as usize);
+        if self.kept_raw.get(index as usize).is_some_and(|a| a.load(Acquire) == raw) {
+            return;
+        }
+        self.keep(index, resource.cloned());
+    }
+
     /// Slot `index` now views `resource` (or nothing of the host's).
     fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
         let Some(slot) = self.kept.get(index as usize) else {
@@ -2912,10 +3155,13 @@ impl HostHeap {
         let old = {
             use windows::core::Interface;
             let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
+            let new_raw = resource.as_ref().map_or(0, |r| r.as_raw() as usize);
             // The same again: nothing to retire.
             if slot.as_ref().map(Interface::as_raw) == resource.as_ref().map(Interface::as_raw) {
+                self.kept_raw[index as usize].store(new_raw, std::sync::atomic::Ordering::Release);
                 return;
             }
+            self.kept_raw[index as usize].store(new_raw, std::sync::atomic::Ordering::Release);
             std::mem::replace(&mut *slot, resource)
         };
         // A running submission may still read the old resource through
@@ -2958,7 +3204,7 @@ impl HostHeap {
         self.put(index);
         // (Bound by its handle, not read by index.)
         self.clear_twin(index);
-        self.keep(index, Some(buffer.clone()));
+        self.keep_ref(index, Some(buffer));
     }
 
     /// Makes slot `index` (a dynamic one) a raw buffer view that reads
@@ -2967,7 +3213,7 @@ impl HostHeap {
         null_buffer_view(self.at(index));
         self.put(index);
         self.clear_twin(index);
-        self.keep(index, None);
+        self.keep_ref(index, None);
     }
 
     /// Makes slot `index` (a dynamic one) a raw unordered access view of
@@ -3001,7 +3247,7 @@ impl HostHeap {
         };
         self.put(index);
         self.clear_twin(index);
-        self.keep(index, Some(buffer.clone()));
+        self.keep_ref(index, Some(buffer));
     }
 
     /// Makes slot `index` (a dynamic one) a raw unordered access view of
@@ -3030,15 +3276,13 @@ impl HostHeap {
         };
         self.put(index);
         self.clear_twin(index);
-        self.keep(index, None);
+        self.keep_ref(index, None);
     }
 
     /// The shader-visible handle of slot `index`.
     pub(crate) fn gpu_handle(&self, index: u32) -> D3D12_GPU_DESCRIPTOR_HANDLE {
-        // SAFETY: a live shader-visible heap.
-        let start = unsafe { self.heap.GetGPUDescriptorHandleForHeapStart().ptr };
         D3D12_GPU_DESCRIPTOR_HANDLE {
-            ptr: start + u64::from(index) * u64::from(self.step),
+            ptr: self.gpu + u64::from(index) * u64::from(self.step),
         }
     }
 
@@ -3089,7 +3333,7 @@ impl HostHeap {
         self.twin_made(index, twin.is_some());
         // After the descriptor: what it showed is let go when nothing shows
         // it any more.
-        self.keep(index, holds.then(|| buffer.clone()));
+        self.keep_ref(index, holds.then_some(buffer));
     }
 
     /// Renderer port 5 (`crate::port_cbv`): makes slot `index` (a dynamic
@@ -5085,6 +5329,41 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn sharded_pool_best_fit_coalesces_and_spans_shards() {
+        let pools = Pools::new(64);
+        let a = pools.take(4).unwrap();
+        let b = pools.take(2).unwrap();
+        pools.give(a, 4);
+        pools.give(b, 2);
+        assert_eq!(pools.free.load(Relaxed), 64);
+
+        // Allocate across multiple shard boundaries via wide span (each shard = 8).
+        let wide = pools.take(20).expect("wide cross-shard span");
+        assert_eq!(pools.free.load(Relaxed), 44);
+        pools.give(wide, 20);
+        // Double-release must be idempotent.
+        pools.give(wide, 20);
+        assert_eq!(pools.free.load(Relaxed), 64);
+
+        // Concurrent take/release across 8 threads.
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                s.spawn(|| {
+                    for _ in 0..200 {
+                        if let Some(p) = pools.take(3) {
+                            pools.give(p, 3);
+                        }
+                    }
+                });
+            }
+        });
+        assert_eq!(pools.free.load(Relaxed), 64);
+        assert_eq!(pools.take(64), Some(0));
+        pools.give(0, 64);
+        assert_eq!(pools.free.load(Relaxed), 64);
+    }
+
     /// Every host sampler heap backs all 2,048 hardware descriptors and
     /// reserves slot 2,047 as a null sentinel so `umin(index, 2047)` in
     /// `victory-shader` never reads past smaller title sampler heaps.
@@ -5569,7 +5848,7 @@ mod tests {
         let (copy, address, bytes) = refreshed.unwrap();
         assert_eq!((address, bytes), (start + 456, 3 * 456));
         assert_eq!(made, copy.buffer, "the descriptor and refresh share a copy");
-        if victory_shader::emit::raw_views() == 0 {
+        if raw_structured() && victory_shader::emit::raw_views() == 0 {
             assert_eq!(copy.span(), (address, bytes));
             eprintln!("the structured slot without a raw twin uses a view-relative copy");
         } else {

@@ -184,8 +184,23 @@ pub(crate) fn take(start: u64) -> Option<Vec<(u32, u32)>> {
     let a = adopted.as_ref().filter(|a| a.start == start)?;
     let mut runs: Vec<(u32, u32)> = Vec::new();
     let mut n = 0u64;
-    for (c, chunk) in a.chunks.iter().enumerate() {
+    let mut c = 0usize;
+    let len = a.chunks.len();
+    let ptr = a.chunks.as_ptr() as *const u8;
+    while c < len {
+        if c + 8 <= len {
+            // SAFETY: `a.chunks` is a leaked `&'static [AtomicU8]` of `len` bytes;
+            // relaxed unaligned word read only skips all-zero 8-byte blocks, and
+            // any non-zero byte is re-checked with `swap(0, AcqRel)` below.
+            let word = unsafe { (ptr.add(c) as *const u64).read_unaligned() };
+            if word == 0 {
+                c += 8;
+                continue;
+            }
+        }
+        let chunk = &a.chunks[c];
         if chunk.load(Relaxed) == 0 {
+            c += 1;
             continue;
         }
         // Cleared before its slots are read: a mark set meanwhile sets it again.
@@ -202,6 +217,7 @@ pub(crate) fn take(start: u64) -> Option<Vec<(u32, u32)>> {
                 _ => runs.push((index, 1)),
             }
         }
+        c += 1;
     }
     TAKEN[0].fetch_add(n, Relaxed);
     TAKEN[1].fetch_add(1, Relaxed);

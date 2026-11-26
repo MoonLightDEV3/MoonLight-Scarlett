@@ -16,7 +16,7 @@
 //! our null command-list limits keep from running.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::mem::offset_of;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -429,6 +429,9 @@ struct Pipeline {
     /// One of the ray-tracing structure builder's ([`Builder`]).
     #[cfg(windows)]
     builder: bool,
+    /// Precomputed skip status from `VICTORY_SKIP_PIPELINES`.
+    #[cfg(windows)]
+    skipped: bool,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
@@ -478,46 +481,66 @@ pub(crate) fn making() -> u64 {
 #[cfg(all(windows, feature = "diagnostics"))]
 static DROPS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
 
-/// Shader hashes as printed in the pipeline diagnostics.
-#[cfg(all(windows, feature = "diagnostics"))]
-fn parse_skip_hashes(value: &str) -> Vec<String> {
-    value
-        .split(',')
-        .map(str::trim)
-        .filter(|hash| !hash.is_empty())
-        .filter_map(|hash| {
-            if hash.len() == 16 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-                Some(hash.to_ascii_lowercase())
-            } else {
-                tracing::warn!(
-                    hash,
-                    "VICTORY_SKIP_PIPELINES expects 16-digit shader hashes"
-                );
-                None
+/// Shader hashes as printed in the pipeline diagnostics (comma/whitespace
+/// separated 16-hex hashes, `"none"`, or `@<file>` paths).
+#[cfg(windows)]
+fn parse_skip_hashes(value: &str) -> HashSet<u64> {
+    let mut set = HashSet::new();
+    for raw in value.split(|c: char| c == ',' || c.is_ascii_whitespace()) {
+        let token = raw.trim();
+        if token.is_empty() || token.eq_ignore_ascii_case("none") {
+            continue;
+        }
+        if let Some(path) = token.strip_prefix('@') {
+            match std::fs::read_to_string(path.trim()) {
+                Ok(contents) => set.extend(parse_skip_hashes(&contents)),
+                Err(error) => tracing::warn!(path, %error, "VICTORY_SKIP_PIPELINES: could not read hash file"),
             }
-        })
-        .collect()
+            continue;
+        }
+        if token.len() == 16 && token.bytes().all(|b| b.is_ascii_hexdigit())
+            && let Ok(parsed) = u64::from_str_radix(token, 16)
+        {
+            set.insert(parsed);
+        } else {
+            tracing::warn!(
+                hash = token,
+                "VICTORY_SKIP_PIPELINES expects 16-digit shader hashes"
+            );
+        }
+    }
+    set
+}
+
+#[cfg(windows)]
+fn skip_set() -> &'static HashSet<u64> {
+    static HASHES: OnceLock<HashSet<u64>> = OnceLock::new();
+    HASHES.get_or_init(|| {
+        let value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
+        parse_skip_hashes(&value)
+    })
+}
+
+#[cfg(windows)]
+fn matches_skip(shaders: &[Arc<Shader>], set: &HashSet<u64>) -> Option<usize> {
+    if set.is_empty() {
+        return None;
+    }
+    shaders.iter().position(|shader| {
+        u64::from_str_radix(&shader.hash, 16)
+            .ok()
+            .is_some_and(|h| set.contains(&h))
+    })
 }
 
 #[cfg(all(windows, feature = "diagnostics"))]
 fn skipped_shader(p: &Pipeline) -> Option<&str> {
-    static HASHES: OnceLock<Vec<String>> = OnceLock::new();
-    let hashes = HASHES.get_or_init(|| {
-        let value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
-        parse_skip_hashes(&value)
-    });
-    if hashes.is_empty() {
-        return None;
-    }
-    p.shaders
-        .iter()
-        .find(|shader| hashes.contains(&shader.hash))
-        .map(|shader| shader.hash.as_str())
+    matches_skip(&p.shaders, skip_set()).map(|idx| p.shaders[idx].hash.as_str())
 }
 
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(windows)]
 pub(crate) fn is_skipped(this: This) -> bool {
-    !this.is_null() && skipped_shader(pipeline(this)).is_some()
+    !this.is_null() && pipeline(this).skipped
 }
 
 /// Counts a draw or dispatch of `this` intentionally skipped or dropped
@@ -575,11 +598,15 @@ fn hand_out(
 ) -> HRESULT {
     tracing::trace!(?shaders, "pipeline state");
     #[cfg(windows)]
+    let skipped = matches_skip(&shaders, skip_set()).is_some();
+    #[cfg(windows)]
     let host = Arc::new(make::Pending::new(shaders.clone(), graphics));
     #[cfg(windows)]
     known::note(host.key(), &shaders, host.graphics.as_deref());
     #[cfg(windows)]
-    make::early(&host);
+    if !skipped {
+        make::early(&host);
+    }
     #[cfg(windows)]
     let builder = of_builder(&shaders);
     #[cfg(windows)]
@@ -596,6 +623,8 @@ fn hand_out(
         host,
         #[cfg(windows)]
         builder,
+        #[cfg(windows)]
+        skipped,
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
     });
@@ -802,14 +831,14 @@ pub fn save_pipeline_cache() {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(all(windows, feature = "diagnostics"))]
+    #[cfg(windows)]
     #[test]
     fn skip_hashes_accepts_full_hashes_only() {
-        assert!(super::parse_skip_hashes(" , ").is_empty());
-        assert_eq!(
-            super::parse_skip_hashes(" 0123456789ABCDEF, 0123456789abcde, xyz, 0011223344556677,"),
-            ["0123456789abcdef", "0011223344556677"]
-        );
+        assert!(super::parse_skip_hashes(" , none ").is_empty());
+        let parsed = super::parse_skip_hashes(" 0123456789ABCDEF, 0123456789abcde, xyz, 0011223344556677,");
+        assert_eq!(parsed.len(), 2);
+        assert!(parsed.contains(&0x0123456789abcdef));
+        assert!(parsed.contains(&0x0011223344556677));
     }
 
     use super::*;

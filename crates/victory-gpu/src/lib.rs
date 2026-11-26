@@ -97,6 +97,8 @@ mod ab;
 #[cfg(windows)]
 mod tdr;
 #[cfg(windows)]
+mod upscale;
+#[cfg(windows)]
 mod texture;
 pub mod timeline;
 #[cfg(windows)]

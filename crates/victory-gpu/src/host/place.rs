@@ -285,17 +285,97 @@ impl HostList {
         STATS[0].fetch_add(1, Ordering::Relaxed);
         STATS[1].fetch_add(len as u64, Ordering::Relaxed);
         to.gpu_writes(self, dst as u64, len as u64);
-        let mut deferred = self.deferred();
-        deferred.copies.push(Step::Placed(Placed {
-            dst,
-            src,
-            len,
-            shadow: to,
-            from: scratch.map(|s| s.2 as usize),
-        }));
-        deferred.title_written();
+        let placed_dst = (dst, dst + len, to.clone());
+        {
+            let mut deferred = self.deferred();
+            deferred.copies.push(Step::Placed(Placed {
+                dst,
+                src,
+                len,
+                shadow: to,
+                from: scratch.map(|s| s.2 as usize),
+            }));
+            deferred.placed_dsts.push(placed_dst);
+            deferred.title_written();
+        }
+        self.has_placed.store(true, Ordering::Release);
         self.changed_something();
         true
+    }
+
+    /// For a constant buffer view `[address, address + size)` whose bytes
+    /// overlap an earlier in-list [`place_copy`] destination: copies those
+    /// bytes on the card from the placed shadow into a device-local buffer at
+    /// this place of the list, eliminating same-list `BEHIND_PLACED` stalls.
+    pub(crate) fn place_constants(&self, address: u64, size: u32) -> Option<(ID3D12Resource, u64)> {
+        if !on() || size == 0 || !self.has_placed.load(Ordering::Acquire) {
+            return None;
+        }
+        let a = address as usize;
+        let e = a.saturating_add(size as usize);
+        let found = {
+            let deferred = self.deferred();
+            deferred
+                .placed_dsts
+                .iter()
+                .rev()
+                .find(|&&(dst, dst_end, _)| a < dst_end && e > dst)
+                .filter(|(_, _, shadow)| {
+                    let (start, len) = shadow.span();
+                    start <= address && address.saturating_add(u64::from(size)) <= start.saturating_add(len)
+                })
+                .map(|(dst, dst_end, shadow)| (*dst, *dst_end, shadow.clone()))
+        };
+        let (dst, dst_end, shadow) = found?;
+        let host = host()?;
+        if a < dst || e > dst_end {
+            shadow.refresh(self, address, u64::from(size));
+        }
+        let aligned = u64::from(size).next_multiple_of(256).max(256);
+        let cb_buf = self.placed_cb_buffer(host, aligned)?;
+        // SAFETY: open command list; live buffers (`shadow` held by placed step/refresh and
+        // `cb_buf` kept alive by `placed_cb_pool`/`keep`), with verified offset and aligned allocation.
+        unsafe {
+            wait_for_all(host, &self.list);
+            self.list
+                .CopyBufferRegion(&cb_buf, 0, &shadow.buffer, shadow.offset(address), u64::from(size));
+            self.list.ResourceBarrier(&[transition(
+                &cb_buf,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_GENERIC_READ,
+            )]);
+        }
+        // SAFETY: `cb_buf` is a live committed buffer.
+        let gpu = unsafe { cb_buf.GetGPUVirtualAddress() };
+        Some((cb_buf, gpu))
+    }
+
+    fn placed_cb_buffer(&self, host: &Host, aligned: u64) -> Option<ID3D12Resource> {
+        {
+            let mut pool = self.placed_cb_pool.lock().unwrap_or_else(|e| e.into_inner());
+            let cursor = pool.1;
+            if let Some(rel) = pool.0[cursor..].iter().position(|&(_, cap)| cap >= aligned) {
+                let idx = cursor + rel;
+                pool.0.swap(cursor, idx);
+                let buf = pool.0[cursor].0.clone();
+                pool.1 = cursor + 1;
+                return Some(buf);
+            }
+        }
+        let cap = aligned.next_multiple_of(1 << 16);
+        let buf = host.uav_buffer_internal(cap)?;
+        name(&buf, || "placed constants".into());
+        {
+            let mut pool = self.placed_cb_pool.lock().unwrap_or_else(|e| e.into_inner());
+            if pool.0.len() < 16 {
+                let cursor = pool.1.min(pool.0.len());
+                pool.0.insert(cursor, (buf.clone(), cap));
+                pool.1 = cursor + 1;
+                return Some(buf);
+            }
+        }
+        self.keep(&buf);
+        Some(buf)
     }
 
     /// For a copy of `[src, src + len)` into a texture: a buffer (readable by
@@ -322,7 +402,7 @@ impl HostList {
 
     /// A buffer on the card for this recording alone.
     fn between(&self, host: &Host, len: u64) -> Option<ID3D12Resource> {
-        let buffer = host.uav_buffer(len.next_multiple_of(1 << 16))?;
+        let buffer = host.uav_buffer_internal(len.next_multiple_of(1 << 16))?;
         name(&buffer, || "bytes between copies".into());
         self.keep(&buffer);
         Some(buffer)
@@ -344,7 +424,7 @@ mod tests {
         let used = || host.video_memory().map_or(0, |m| m[1] >> 20);
         let before = used();
         let t = std::time::Instant::now();
-        let card: Vec<_> = (0..N).map(|_| host.uav_buffer(1 << 16)).collect();
+        let card: Vec<_> = (0..N).map(|_| host.uav_buffer_internal(1 << 16)).collect();
         let card_us = t.elapsed().as_micros() as f64 / N as f64;
         let after = used();
         let t = std::time::Instant::now();
