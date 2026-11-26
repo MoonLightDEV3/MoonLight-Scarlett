@@ -13,7 +13,7 @@ use std::ffi::c_void;
 use std::ops::Deref;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{Condvar, LazyLock, Mutex, MutexGuard, PoisonError};
+use std::sync::{Condvar, LazyLock, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread::ThreadId;
 use std::time::{Duration, Instant};
 
@@ -61,23 +61,31 @@ const DEVICES: usize = PADS + 2;
 const HISTORY: usize = 256;
 const POLL: Duration = Duration::from_millis(8);
 
-/// The keyboard's stand-in gamepad (virtual key, button); README lists it.
-/// Sticks: W/A/S/D left, I/J/K/L right; triggers Z and C.
-const FALLBACK_BUTTONS: [(u8, u32); 14] = [
-    (0x1B, MENU), // Esc
-    (0x09, VIEW), // Tab
-    (0x0D, A),    // Enter
-    (0x08, B),    // Backspace
-    (b'X', X),
-    (b'Y', Y),
-    (0x26, UP), // arrows
-    (0x28, DOWN),
-    (0x25, LEFT),
-    (0x27, RIGHT),
-    (b'Q', LEFT_SHOULDER),
-    (b'E', RIGHT_SHOULDER),
-    (b'F', LEFT_STICK),
-    (b'H', RIGHT_STICK),
+/// The keyboard's stand-in gamepad (virtual key, button).
+/// Sticks: W/A/S/D left, mouse (or I/J/K/L) right; triggers RMB/LMB (or Z/C).
+const FALLBACK_BUTTONS: [(u8, u32); 22] = [
+    (0x1B, MENU),           // Esc (Pause / Map)
+    (b'P', MENU),           // P (Pause / Map)
+    (b'V', VIEW),           // V (Change camera)
+    (0xA0, A),              // Left Shift (Sprint)
+    (0xA1, A),              // Right Shift (Sprint)
+    (0x0D, A),              // Enter (Confirm)
+    (b'R', B),              // R (Reload / Melee)
+    (0x08, B),              // Backspace (Cancel)
+    (0x20, X),              // Space (Jump / Climb)
+    (b'X', X),              // X (Jump fallback)
+    (b'F', Y),              // F (Enter / Exit vehicle)
+    (b'Y', Y),              // Y (Vehicle fallback)
+    (0x26, UP),             // Up arrow (Phone / D-pad up)
+    (0x28, DOWN),           // Down arrow (D-pad down)
+    (0x25, LEFT),           // Left arrow (D-pad left)
+    (0x27, RIGHT),          // Right arrow (D-pad right)
+    (b'E', RIGHT),          // E (Context interact / D-pad right)
+    (0x09, LEFT_SHOULDER),  // Tab (Weapon wheel / LB)
+    (b'Q', RIGHT_SHOULDER), // Q (Cover / Handbrake / RB)
+    (0xA2, LEFT_STICK),     // Left Ctrl (Crouch / Stealth / Horn / L3)
+    (0xA3, LEFT_STICK),     // Right Ctrl (L3)
+    (b'H', RIGHT_STICK),    // H (Look behind / R3; also Middle Mouse)
 ];
 
 /// A gamepad reading: triggers 0 to 1, sticks -1 to 1 (up positive).
@@ -111,8 +119,79 @@ trait Source: Send {
     fn pad(&mut self, slot: usize) -> Option<PadState>;
     /// Keys held down; none while the title's window lacks focus.
     fn keys(&mut self) -> Vec<KeyState>;
+    /// Virtual pad axes and triggers from captured mouse look.
+    fn mouse(&mut self) -> PadState {
+        PadState::default()
+    }
     /// Motor speeds: low frequency (left), high frequency (right).
     fn rumble(&mut self, slot: usize, low: u16, high: u16);
+}
+
+#[derive(Default)]
+struct MouseLook {
+    vx: f32,
+    vy: f32,
+}
+
+impl MouseLook {
+    /// Decay per 8 ms poll tick: keeps a flick alive across 15–30 FPS frames
+    /// (~33–66 ms) and decays cleanly to zero with no residual drift.
+    const DECAY: f32 = 0.72;
+    const BASE_SCALE: f32 = 0.045;
+    const DEADZONE: f32 = 0.015;
+
+    #[allow(clippy::too_many_arguments)]
+    fn step(
+        &mut self,
+        dx: i32,
+        dy: i32,
+        captured: bool,
+        sens: f32,
+        invert_y: bool,
+        left_btn: bool,
+        right_btn: bool,
+        middle_btn: bool,
+    ) -> PadState {
+        if !captured {
+            self.vx = 0.0;
+            self.vy = 0.0;
+            return PadState::default();
+        }
+        let scale = Self::BASE_SCALE * sens;
+        let y_sign = if invert_y { 1.0 } else { -1.0 };
+        self.vx = (self.vx * Self::DECAY + (dx as f32) * scale).clamp(-1.0, 1.0);
+        self.vy = (self.vy * Self::DECAY + (dy as f32) * scale * y_sign).clamp(-1.0, 1.0);
+        if self.vx.abs() < Self::DEADZONE {
+            self.vx = 0.0;
+        }
+        if self.vy.abs() < Self::DEADZONE {
+            self.vy = 0.0;
+        }
+        PadState {
+            buttons: if middle_btn { RIGHT_STICK } else { 0 },
+            left_trigger: if right_btn { 1.0 } else { 0.0 },
+            right_trigger: if left_btn { 1.0 } else { 0.0 },
+            right_x: self.vx,
+            right_y: self.vy,
+            ..PadState::default()
+        }
+    }
+}
+
+fn mouse_sensitivity() -> f32 {
+    static SENS: OnceLock<f32> = OnceLock::new();
+    *SENS.get_or_init(|| {
+        std::env::var("VICTORY_MOUSE_SENS")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .map_or(1.0, |v| v.clamp(0.05, 20.0))
+    })
+}
+
+fn mouse_invert_y() -> bool {
+    static INVERT: OnceLock<bool> = OnceLock::new();
+    *INVERT.get_or_init(|| std::env::var_os("VICTORY_MOUSE_INVERT_Y").is_some_and(|v| v == "1"))
 }
 
 fn fallback(keys: &[KeyState]) -> PadState {
@@ -430,12 +509,14 @@ impl Hub {
 
     /// Reads the host once; device callbacks run on the calling thread.
     fn poll(&self) {
-        let (pads, keys) = {
+        let (pads, keys, mouse) = {
             let mut source = lock(&self.source);
             let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
-            (pads, source.keys())
+            (pads, source.keys(), source.mouse())
         };
-        let events = self.state().poll(&self.devices, self.one_pad, pads, keys);
+        let events = self
+            .state()
+            .poll(&self.devices, self.one_pad, pads, keys, mouse);
         self.deliver(events);
     }
 
@@ -481,11 +562,13 @@ impl State {
         one_pad: bool,
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
+        mouse: PadState,
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
+        let stand_in = merged(fallback(&keys), mouse);
         if one_pad {
-            let pad = pads.into_iter().flatten().fold(fallback(&keys), merged);
+            let pad = pads.into_iter().flatten().fold(stand_in, merged);
             self.update(devices, FALLBACK, Some(Value::Pad(pad)), now, &mut events);
             self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
             return events;
@@ -494,7 +577,7 @@ impl State {
         for (slot, pad) in pads.into_iter().enumerate() {
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
-        let fallback = (!any_pad).then(|| Value::Pad(fallback(&keys)));
+        let fallback = (!any_pad).then_some(Value::Pad(stand_in));
         self.update(devices, FALLBACK, fallback, now, &mut events);
         self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
         events
@@ -1177,6 +1260,7 @@ mod host {
     #[derive(Default)]
     pub(super) struct Host {
         empty_until: [Option<Instant>; PADS],
+        mouse_look: super::MouseLook,
     }
 
     impl Source for Host {
@@ -1233,6 +1317,25 @@ mod host {
                     ..Default::default()
                 })
                 .collect()
+        }
+
+        fn mouse(&mut self) -> PadState {
+            let (dx, dy) = crate::modules::lifecycle::take_mouse_delta();
+            let captured = crate::modules::lifecycle::mouse_captured() && focused();
+            let held = |vk: i32| captured && unsafe { GetAsyncKeyState(vk) } < 0;
+            let lmb = !crate::modules::lifecycle::mouse_lmb_suppressed() && held(0x01);
+            let rmb = held(0x02);
+            let mmb = held(0x04);
+            self.mouse_look.step(
+                dx,
+                dy,
+                captured,
+                super::mouse_sensitivity(),
+                super::mouse_invert_y(),
+                lmb,
+                rmb,
+                mmb,
+            )
         }
 
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
@@ -1710,5 +1813,66 @@ mod tests {
         rumble(&hub.devices[FALLBACK], &[1.0; 4]);
         rumble(device, std::ptr::null());
         assert_eq!(host.lock().unwrap().rumble, [(2, 32767, 65535), (2, 0, 0)]);
+    }
+
+    #[test]
+    fn mouse_look_maps_deltas_and_decays_to_zero() {
+        let mut look = MouseLook::default();
+        // Mouse right (+dx) and mouse up (-dy) -> +right_x and +right_y.
+        let p = look.step(10, -8, true, 1.0, false, false, false, false);
+        assert!(p.right_x > 0.0 && p.right_x <= 1.0);
+        assert!(p.right_y > 0.0 && p.right_y <= 1.0);
+
+        // Inverted Y flips the vertical axis sign.
+        let mut inverted = MouseLook::default();
+        let inv = inverted.step(0, -8, true, 1.0, true, false, false, false);
+        assert!(inv.right_y < 0.0);
+
+        // Large deltas clamp to [-1.0, 1.0] and mouse buttons map to RT/LT/R3.
+        let clamped = look.step(500, 500, true, 2.0, false, true, true, true);
+        assert_eq!(clamped.right_x, 1.0);
+        assert_eq!(clamped.right_y, -1.0);
+        assert_eq!(clamped.right_trigger, 1.0);
+        assert_eq!(clamped.left_trigger, 1.0);
+        assert_eq!(clamped.buttons, RIGHT_STICK);
+
+        // Combined with keyboard WASD, both sticks work simultaneously.
+        let combined = merged(fallback(&[key(b'W')]), clamped);
+        assert_eq!(combined.left_y, 1.0);
+        assert_eq!(combined.right_x, 1.0);
+        assert_eq!(combined.right_y, -1.0);
+
+        // Zero-delta ticks decay smoothly to zero.
+        let mut end = clamped;
+        for _ in 0..25 {
+            end = look.step(0, 0, true, 1.0, false, false, false, false);
+        }
+        assert_eq!(end.right_x, 0.0);
+        assert_eq!(end.right_y, 0.0);
+
+        // Release clears velocity immediately.
+        let _ = look.step(10, -10, true, 1.0, false, true, true, true);
+        let released = look.step(10, -10, false, 1.0, false, true, true, true);
+        assert_eq!(released, PadState::default());
+    }
+
+    #[test]
+    fn pc_controls_map_to_gamepad_actions() {
+        let p = fallback(&[
+            key(0xA0),
+            key(0x20),
+            key(b'F'),
+            key(b'R'),
+            key(0x09),
+            key(b'Q'),
+            key(b'E'),
+            key(b'V'),
+            key(0xA2),
+            key(b'P'),
+        ]);
+        assert_eq!(
+            p.buttons,
+            A | X | Y | B | LEFT_SHOULDER | RIGHT_SHOULDER | RIGHT | VIEW | LEFT_STICK | MENU
+        );
     }
 }

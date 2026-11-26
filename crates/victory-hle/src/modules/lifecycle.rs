@@ -9,12 +9,18 @@
 #![allow(clippy::too_many_arguments)]
 
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
-use windows_sys::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows_sys::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows_sys::Win32::Graphics::Gdi::{
+    ClientToScreen, GetMonitorInfoW, MONITOR_DEFAULTTOPRIMARY, MONITOR_DEFAULTTONEAREST,
+    MONITORINFO, MonitorFromPoint, MonitorFromWindow,
+};
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
+use windows_sys::Win32::UI::Input as raw_input;
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_F8, VK_F11, VK_MENU, VK_RETURN};
 use windows_sys::Win32::UI::WindowsAndMessaging::{self as wm, HMENU};
 use windows_sys::core::{PCSTR, PCWSTR, w};
 
@@ -110,8 +116,9 @@ pub extern "system" fn CreateWindowExW(
     instance: HINSTANCE,
     param: *const c_void,
 ) -> HWND {
-    let (x, y, width, height) = fit(parent, x, y, width, height);
-    // SAFETY: the title's own arguments, forwarded (the size fitted).
+    let (ex_style, style, x, y, width, height) =
+        prepare_create(parent, ex_style, style, x, y, width, height);
+    // SAFETY: the title's own arguments, forwarded (size and fullscreen style prepared).
     let hwnd = unsafe {
         wm::CreateWindowExW(
             ex_style, class, name, style, x, y, width, height, parent, menu, instance, param,
@@ -136,8 +143,9 @@ pub extern "system" fn CreateWindowExA(
     instance: HINSTANCE,
     param: *const c_void,
 ) -> HWND {
-    let (x, y, width, height) = fit(parent, x, y, width, height);
-    // SAFETY: the title's own arguments, forwarded (the size fitted).
+    let (ex_style, style, x, y, width, height) =
+        prepare_create(parent, ex_style, style, x, y, width, height);
+    // SAFETY: the title's own arguments, forwarded (size and fullscreen style prepared).
     let hwnd = unsafe {
         wm::CreateWindowExA(
             ex_style, class, name, style, x, y, width, height, parent, menu, instance, param,
@@ -145,6 +153,204 @@ pub extern "system" fn CreateWindowExA(
     };
     hook(hwnd);
     hwnd
+}
+
+const FULLSCREEN_STRIP_STYLE: u32 =
+    wm::WS_CAPTION | wm::WS_THICKFRAME | wm::WS_MINIMIZEBOX | wm::WS_MAXIMIZEBOX | wm::WS_SYSMENU;
+const FULLSCREEN_STRIP_EX_STYLE: u32 =
+    wm::WS_EX_DLGMODALFRAME | wm::WS_EX_WINDOWEDGE | wm::WS_EX_CLIENTEDGE | wm::WS_EX_STATICEDGE;
+
+struct WindowMode {
+    fullscreen: bool,
+    windowed_style: u32,
+    windowed_ex_style: u32,
+    windowed_rect: RECT,
+}
+
+static WINDOW_MODE: Mutex<WindowMode> = Mutex::new(WindowMode {
+    fullscreen: false,
+    windowed_style: 0,
+    windowed_ex_style: 0,
+    windowed_rect: RECT {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    },
+});
+
+fn start_fullscreen() -> bool {
+    static FULLSCREEN: OnceLock<bool> = OnceLock::new();
+    *FULLSCREEN.get_or_init(|| {
+        std::env::var_os("VICTORY_FULLSCREEN").is_none_or(|v| v != "0")
+            && std::env::var_os("VICTORY_WINDOW_MAX").is_none()
+    })
+}
+
+fn monitor_rect_for_window(hwnd: HWND) -> Option<RECT> {
+    let mut info = MONITORINFO {
+        cbSize: size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: valid monitor handle query and sized MONITORINFO buffer.
+    let ok = unsafe {
+        let mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        GetMonitorInfoW(mon, &mut info)
+    };
+    (ok != 0).then_some(info.rcMonitor)
+}
+
+fn primary_monitor_rect(x: i32, y: i32) -> Option<RECT> {
+    let mut info = MONITORINFO {
+        cbSize: size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: valid monitor handle query and sized MONITORINFO buffer.
+    let ok = unsafe {
+        let mon = MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTOPRIMARY);
+        GetMonitorInfoW(mon, &mut info)
+    };
+    (ok != 0).then_some(info.rcMonitor)
+}
+
+fn prepare_create(
+    parent: HWND,
+    ex_style: u32,
+    style: u32,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+) -> (u32, u32, i32, i32, i32, i32) {
+    let (wx, wy, ww, wh) = fit(parent, x, y, width, height);
+    if !parent.is_null() || width < 320 || height < 200 {
+        return (ex_style, style, wx, wy, ww, wh);
+    }
+    let fallback_style = if style & wm::WS_CAPTION != 0 {
+        style
+    } else {
+        (style & !wm::WS_POPUP) | wm::WS_OVERLAPPEDWINDOW
+    };
+    let mut mode = WINDOW_MODE.lock().unwrap_or_else(|e| e.into_inner());
+    mode.windowed_style = fallback_style;
+    mode.windowed_ex_style = ex_style;
+    mode.windowed_rect = RECT {
+        left: wx,
+        top: wy,
+        right: wx + ww,
+        bottom: wy + wh,
+    };
+    if start_fullscreen()
+        && let Some(rc) = primary_monitor_rect(wx, wy)
+    {
+        mode.fullscreen = true;
+        let fs_style = (style & !FULLSCREEN_STRIP_STYLE) | wm::WS_POPUP;
+        let fs_ex_style = ex_style & !FULLSCREEN_STRIP_EX_STYLE;
+        return (
+            fs_ex_style,
+            fs_style,
+            rc.left,
+            rc.top,
+            rc.right - rc.left,
+            rc.bottom - rc.top,
+        );
+    }
+    mode.fullscreen = false;
+    (ex_style, style, wx, wy, ww, wh)
+}
+
+fn toggle_fullscreen(hwnd: HWND) {
+    if !is_top_level(hwnd) {
+        return;
+    }
+    enum Action {
+        Enter { style: u32, ex_style: u32, rect: RECT },
+        Leave { style: u32, ex_style: u32, rect: RECT },
+    }
+    let action = {
+        let mut mode = WINDOW_MODE.lock().unwrap_or_else(|e| e.into_inner());
+        if !mode.fullscreen {
+            // SAFETY: reads live window style/bounds on the window thread.
+            let style = unsafe { wm::GetWindowLongPtrW(hwnd, wm::GWL_STYLE) } as u32;
+            // SAFETY: as above.
+            let ex_style = unsafe { wm::GetWindowLongPtrW(hwnd, wm::GWL_EXSTYLE) } as u32;
+            let mut rect = RECT::default();
+            // SAFETY: `rect` receives current outer window bounds.
+            if unsafe { wm::GetWindowRect(hwnd, &mut rect) } != 0 {
+                mode.windowed_rect = rect;
+            }
+            mode.windowed_style = style;
+            mode.windowed_ex_style = ex_style;
+            let Some(rc) = monitor_rect_for_window(hwnd) else {
+                return;
+            };
+            mode.fullscreen = true;
+            Action::Enter {
+                style: (style & !FULLSCREEN_STRIP_STYLE) | wm::WS_POPUP | wm::WS_VISIBLE,
+                ex_style: ex_style & !FULLSCREEN_STRIP_EX_STYLE,
+                rect: rc,
+            }
+        } else {
+            mode.fullscreen = false;
+            let style = if mode.windowed_style != 0 {
+                mode.windowed_style | wm::WS_VISIBLE
+            } else {
+                wm::WS_OVERLAPPEDWINDOW | wm::WS_VISIBLE
+            };
+            let mut rect = mode.windowed_rect;
+            if rect.right <= rect.left || rect.bottom <= rect.top {
+                let (x, y, w, h) = fit(std::ptr::null_mut(), 0, 0, 1280, 720);
+                rect = RECT {
+                    left: x,
+                    top: y,
+                    right: x + w,
+                    bottom: y + h,
+                };
+            }
+            Action::Leave {
+                style,
+                ex_style: mode.windowed_ex_style,
+                rect,
+            }
+        }
+    };
+    match action {
+        Action::Enter { style, ex_style, rect } => {
+            // SAFETY: updates top-level window frame and covers the monitor in borderless mode.
+            unsafe {
+                wm::SetWindowLongPtrW(hwnd, wm::GWL_STYLE, style as isize);
+                wm::SetWindowLongPtrW(hwnd, wm::GWL_EXSTYLE, ex_style as isize);
+                wm::SetWindowPos(
+                    hwnd,
+                    wm::HWND_TOP,
+                    rect.left,
+                    rect.top,
+                    rect.right - rect.left,
+                    rect.bottom - rect.top,
+                    wm::SWP_NOOWNERZORDER | wm::SWP_FRAMECHANGED | wm::SWP_SHOWWINDOW,
+                );
+            }
+        }
+        Action::Leave { style, ex_style, rect } => {
+            // SAFETY: restores the saved windowed frame and bounds.
+            unsafe {
+                wm::SetWindowLongPtrW(hwnd, wm::GWL_STYLE, style as isize);
+                wm::SetWindowLongPtrW(hwnd, wm::GWL_EXSTYLE, ex_style as isize);
+                wm::SetWindowPos(
+                    hwnd,
+                    wm::HWND_NOTOPMOST,
+                    rect.left,
+                    rect.top,
+                    rect.right - rect.left,
+                    rect.bottom - rect.top,
+                    wm::SWP_NOOWNERZORDER | wm::SWP_FRAMECHANGED | wm::SWP_SHOWWINDOW,
+                );
+            }
+        }
+    }
+    if mouse_captured() {
+        clip_to_client(hwnd);
+    }
 }
 
 /// A console title sizes its window to its render target (
@@ -228,19 +434,125 @@ fn fit_into(area: &RECT, width: i32, height: i32) -> (i32, i32) {
 
 /// Whether client-area mouse look is captured and the host cursor should stay hidden.
 static CURSOR_HIDDEN: AtomicBool = AtomicBool::new(false);
+static MOUSE_CAPTURED: AtomicBool = AtomicBool::new(false);
+static WAIT_LMB_UP: AtomicBool = AtomicBool::new(false);
+static MOUSE_DX: AtomicI32 = AtomicI32::new(0);
+static MOUSE_DY: AtomicI32 = AtomicI32::new(0);
 
-#[allow(dead_code)]
 pub(crate) fn set_cursor_hidden(hidden: bool) {
     CURSOR_HIDDEN.store(hidden, Ordering::Relaxed);
 }
 
+pub(crate) fn mouse_look_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("VICTORY_MOUSE_LOOK").is_none_or(|v| v != "0"))
+}
+
+pub(crate) fn mouse_captured() -> bool {
+    MOUSE_CAPTURED.load(Ordering::Relaxed)
+}
+
+pub(crate) fn mouse_lmb_suppressed() -> bool {
+    WAIT_LMB_UP.load(Ordering::Relaxed)
+}
+
+pub(crate) fn take_mouse_delta() -> (i32, i32) {
+    (
+        MOUSE_DX.swap(0, Ordering::Relaxed),
+        MOUSE_DY.swap(0, Ordering::Relaxed),
+    )
+}
+
 fn arrow_cursor() -> wm::HCURSOR {
-    static ARROW: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    static ARROW: OnceLock<usize> = OnceLock::new();
     // SAFETY: standard shared system arrow cursor handle (never destroyed).
     let raw = *ARROW.get_or_init(|| unsafe {
         wm::LoadCursorW(std::ptr::null_mut(), wm::IDC_ARROW) as usize
     });
     raw as wm::HCURSOR
+}
+
+fn is_top_level(hwnd: HWND) -> bool {
+    // SAFETY: standard Win32 parent query on a live window handle.
+    unsafe { wm::GetParent(hwnd) }.is_null()
+}
+
+fn clip_to_client(hwnd: HWND) {
+    let mut rect = RECT::default();
+    // SAFETY: `rect` receives client bounds on the window thread.
+    if unsafe { wm::GetClientRect(hwnd, &mut rect) } == 0 {
+        return;
+    }
+    let mut tl = POINT {
+        x: rect.left,
+        y: rect.top,
+    };
+    let mut br = POINT {
+        x: rect.right,
+        y: rect.bottom,
+    };
+    // SAFETY: client points converted to screen coordinates for `ClipCursor`.
+    unsafe {
+        if ClientToScreen(hwnd, &mut tl) == 0 || ClientToScreen(hwnd, &mut br) == 0 {
+            return;
+        }
+        if br.x > tl.x && br.y > tl.y {
+            let screen = RECT {
+                left: tl.x,
+                top: tl.y,
+                right: br.x,
+                bottom: br.y,
+            };
+            wm::ClipCursor(&screen);
+        }
+    }
+}
+
+fn capture_mouse(hwnd: HWND, suppress_lmb: bool) {
+    MOUSE_DX.store(0, Ordering::Relaxed);
+    MOUSE_DY.store(0, Ordering::Relaxed);
+    WAIT_LMB_UP.store(suppress_lmb, Ordering::Relaxed);
+    MOUSE_CAPTURED.store(true, Ordering::Relaxed);
+    set_cursor_hidden(true);
+    // SAFETY: hides the cursor and clips pointer travel inside the game client area.
+    unsafe { wm::SetCursor(std::ptr::null_mut()) };
+    clip_to_client(hwnd);
+}
+
+fn release_mouse() {
+    MOUSE_CAPTURED.store(false, Ordering::Relaxed);
+    WAIT_LMB_UP.store(false, Ordering::Relaxed);
+    MOUSE_DX.store(0, Ordering::Relaxed);
+    MOUSE_DY.store(0, Ordering::Relaxed);
+    set_cursor_hidden(false);
+    // SAFETY: unclips the pointer and restores the arrow cursor.
+    unsafe {
+        wm::ClipCursor(std::ptr::null());
+        wm::SetCursor(arrow_cursor());
+    }
+}
+
+fn register_raw_mouse(hwnd: HWND) {
+    if !mouse_look_enabled() || !is_top_level(hwnd) {
+        return;
+    }
+    let device = raw_input::RAWINPUTDEVICE {
+        usUsagePage: 0x01,
+        usUsage: 0x02,
+        dwFlags: 0,
+        hwndTarget: hwnd,
+    };
+    // SAFETY: valid single-element RAWINPUTDEVICE slice targeting `hwnd`.
+    if unsafe {
+        raw_input::RegisterRawInputDevices(
+            &device,
+            1,
+            size_of::<raw_input::RAWINPUTDEVICE>() as u32,
+        )
+    } == 0
+    {
+        tracing::warn!("RegisterRawInputDevices failed for mouse look");
+    }
 }
 
 /// Puts our procedure in front of the title's.
@@ -255,6 +567,7 @@ fn hook(hwnd: HWND) {
         wm::SetPropW(hwnd, TITLE_PROC, title as *mut c_void);
         wm::SetWindowLongPtrW(hwnd, wm::GWLP_WNDPROC, window_proc as *const () as isize);
     }
+    register_raw_mouse(hwnd);
 }
 
 extern "system" fn window_proc(
@@ -266,6 +579,7 @@ extern "system" fn window_proc(
     // A user close (close button, Alt+F4, window or taskbar menu); a
     // console title never sees one, nor a WM_CLOSE from it.
     if message == wm::WM_SYSCOMMAND && wparam & 0xFFF0 == wm::SC_CLOSE as usize {
+        release_mouse();
         end_title("window closed", Box::new(|| {}));
         return 0;
     }
@@ -276,6 +590,81 @@ extern "system" fn window_proc(
     // the title aborts itself about half a minute later. A console has no window
     // menu. The mouse still opens it from the title bar.
     if message == wm::WM_SYSCOMMAND && wparam & 0xFFF0 == wm::SC_KEYMENU as usize {
+        return 0;
+    }
+    if message == wm::WM_LBUTTONDOWN && mouse_look_enabled() && !mouse_captured() && is_top_level(hwnd) {
+        capture_mouse(hwnd, true);
+        return 0;
+    }
+    if message == wm::WM_LBUTTONUP {
+        WAIT_LMB_UP.store(false, Ordering::Relaxed);
+    }
+    if message == wm::WM_KEYDOWN
+        && wparam == usize::from(VK_F11)
+        && (lparam & (1 << 30)) == 0
+    {
+        toggle_fullscreen(hwnd);
+        return 0;
+    }
+    if message == wm::WM_SYSKEYDOWN
+        && wparam == usize::from(VK_RETURN)
+        && (lparam & (1 << 29)) != 0
+        && (lparam & (1 << 30)) == 0
+    {
+        toggle_fullscreen(hwnd);
+        return 0;
+    }
+    if message == wm::WM_KEYDOWN
+        && wparam == usize::from(VK_F8)
+        && (lparam & (1 << 30)) == 0
+        && mouse_look_enabled()
+    {
+        if mouse_captured() {
+            release_mouse();
+        } else if is_top_level(hwnd) {
+            capture_mouse(hwnd, false);
+        }
+        return 0;
+    }
+    if message == wm::WM_SYSKEYDOWN && wparam == usize::from(VK_MENU) && mouse_captured() {
+        release_mouse();
+    }
+    if (message == wm::WM_KILLFOCUS
+        || (message == wm::WM_ACTIVATE && (wparam & 0xFFFF) == wm::WA_INACTIVE as usize)
+        || message == wm::WM_NCDESTROY)
+        && mouse_captured()
+    {
+        release_mouse();
+    }
+    if (message == wm::WM_SIZE || message == wm::WM_MOVE) && mouse_captured() {
+        clip_to_client(hwnd);
+    }
+    if message == wm::WM_INPUT && mouse_captured() {
+        // SAFETY: stack buffer zeroed before `GetRawInputData` populates it.
+        let mut raw: raw_input::RAWINPUT = unsafe { std::mem::zeroed() };
+        let mut size = size_of::<raw_input::RAWINPUT>() as u32;
+        // SAFETY: `lparam` is a valid `HRAWINPUT` during `WM_INPUT`.
+        let got = unsafe {
+            raw_input::GetRawInputData(
+                lparam as raw_input::HRAWINPUT,
+                raw_input::RID_INPUT,
+                (&raw mut raw).cast(),
+                &mut size,
+                size_of::<raw_input::RAWINPUTHEADER>() as u32,
+            )
+        };
+        if got != u32::MAX && raw.header.dwType == raw_input::RIM_TYPEMOUSE {
+            // SAFETY: `dwType == RIM_TYPEMOUSE` selects the `mouse` union arm.
+            let mouse = unsafe { &raw.data.mouse };
+            if (mouse.usFlags & raw_input::MOUSE_MOVE_ABSOLUTE) == 0 {
+                if mouse.lLastX != 0 {
+                    MOUSE_DX.fetch_add(mouse.lLastX, Ordering::Relaxed);
+                }
+                if mouse.lLastY != 0 {
+                    MOUSE_DY.fetch_add(mouse.lLastY, Ordering::Relaxed);
+                }
+            }
+        }
         return 0;
     }
     // Console titles register WNDCLASS with hCursor = NULL and ignore WM_SETCURSOR,
@@ -306,6 +695,7 @@ extern "system" fn window_proc(
 /// Suspends the title as the console does when it ends it, runs `then`
 /// (once), then ends the process. Returns at once; later calls do nothing.
 pub(crate) fn end_title(why: &'static str, then: Box<dyn FnOnce() + Send>) {
+    release_mouse();
     static ENDING: AtomicBool = AtomicBool::new(false);
     if ENDING.swap(true, Ordering::SeqCst) {
         return;
@@ -699,5 +1089,56 @@ mod tests {
         assert_eq!(client_res, 1);
         let seen = CURSORS.with(|c| c.borrow().clone());
         assert_eq!(seen, [wm::HTCAPTION as usize]);
+    }
+
+    #[test]
+    fn mouse_delta_drains_and_resets() {
+        let _ = take_mouse_delta();
+        MOUSE_DX.fetch_add(12, Ordering::Relaxed);
+        MOUSE_DY.fetch_add(-7, Ordering::Relaxed);
+        assert_eq!(take_mouse_delta(), (12, -7));
+        assert_eq!(take_mouse_delta(), (0, 0));
+    }
+
+    #[test]
+    fn f11_toggles_borderless_fullscreen_and_restores_windowed_style() {
+        let null = std::ptr::null_mut();
+        // SAFETY: creates a local top-level test window with static class/caption.
+        let hwnd = unsafe {
+            wm::CreateWindowExW(
+                0,
+                w!("STATIC"),
+                w!("fullscreen"),
+                wm::WS_OVERLAPPEDWINDOW,
+                100,
+                100,
+                640,
+                360,
+                null,
+                null,
+                null,
+                std::ptr::null(),
+            )
+        };
+        assert!(!hwnd.is_null());
+        hook(hwnd);
+        {
+            let mut mode = WINDOW_MODE.lock().unwrap_or_else(|e| e.into_inner());
+            mode.fullscreen = false;
+        }
+        // SAFETY: synchronous messages sent to a window created on this thread.
+        unsafe {
+            wm::SendMessageW(hwnd, wm::WM_KEYDOWN, usize::from(VK_F11), 0);
+            let fs_style = wm::GetWindowLongPtrW(hwnd, wm::GWL_STYLE) as u32;
+            assert_ne!(fs_style & wm::WS_POPUP, 0);
+            assert_eq!(fs_style & wm::WS_CAPTION, 0);
+
+            wm::SendMessageW(hwnd, wm::WM_KEYDOWN, usize::from(VK_F11), 0);
+            let restored_style = wm::GetWindowLongPtrW(hwnd, wm::GWL_STYLE) as u32;
+            assert_eq!(restored_style & wm::WS_POPUP, 0);
+            assert_ne!(restored_style & wm::WS_CAPTION, 0);
+
+            wm::DestroyWindow(hwnd);
+        }
     }
 }

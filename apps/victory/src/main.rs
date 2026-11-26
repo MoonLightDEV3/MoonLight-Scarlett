@@ -321,9 +321,9 @@ fn apply_runtime_defaults() {
     // Disable Wave32 LDS flag-region pass (PR #4) on NVIDIA: compiling 2cc4c197ee29e291
     // without full Wave64 LDS sync blacks out opaque lighting tiles on cinderblock walls.
     set_default("VICTORY_LDS_FLAGS", "0");
-    // 720p@0.60 internal scale (768x432 -> 720p TAAU) + unlocked frame interval for RTX 5060 8 GB laptop.
-    set_default("VICTORY_OUTPUT", "1280x720");
-    set_default("VICTORY_RENDER_SCALE", "0.60");
+    // 1080p@0.50 internal scale (960x540 -> 1080p TAAU) + unlocked frame interval for RTX 5060 8 GB laptop.
+    set_default("VICTORY_OUTPUT", "1920x1080");
+    set_default("VICTORY_RENDER_SCALE", "0.50");
     set_default("VICTORY_FRAME_INTERVAL_MS", "16.667");
     // Pipeline compiler: 6 low-priority background workers + extended NVIDIA 1M dynamic slots.
     set_default("VICTORY_DYNAMIC_SLOTS", "499999");

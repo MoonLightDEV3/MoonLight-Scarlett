@@ -8929,7 +8929,8 @@ impl Batch {
             let started = std::time::Instant::now();
             #[cfg(feature = "diagnostics")]
             let all = self.refreshes.len();
-            self.refreshes.retain(|(shadow, from, to)| !shadow.nothing_new(*from, *to - *from));
+            let j = crate::watch::read_journal();
+            self.refreshes.retain(|(shadow, from, to)| !shadow.nothing_new_in(*from, *to - *from, &j));
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             FLUSHES[2].fetch_add((all - self.refreshes.len()) as u64, Ordering::Relaxed);
@@ -8973,9 +8974,10 @@ impl Batch {
                         crate::shadow::wide_each(chunks, move |c| {
                             let start = c * CHUNK;
                             let end = (start + CHUNK).min(refreshes.len());
+                            let j = crate::watch::read_journal();
                             let mut kept = Vec::new();
                             for (offset, (shadow, from, to)) in refreshes[start..end].iter().enumerate() {
-                                if !shadow.nothing_new(*from, *to - *from) {
+                                if !shadow.nothing_new_in(*from, *to - *from, &j) {
                                     kept.push(start + offset);
                                 }
                             }
@@ -10202,6 +10204,7 @@ impl Host {
             let swap_chain = factory
                 .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?
                 .cast::<IDXGISwapChain3>()?;
+            let _ = factory.MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER);
             let copy = self.new_list()?;
             copy.close();
             tracing::info!(width, height, format = format.0, "presenting to a window");
