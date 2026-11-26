@@ -6,19 +6,21 @@ An Xbox Series X|S (Scarlett) compatibility layer for Windows, forked from [avat
 
 ---
 
-## Measured Performance & 30-Minute Endurance Validation (2026-11-26)
+## Measured Performance & Validation (2026-11-26)
 
 - **Test Hardware:** Windows 11 x64, Intel Core i9-13900H, 16 GB System RAM, NVIDIA GeForce RTX 5060 Laptop GPU (8 GB VRAM, Wave32)
-- **Profile:** `--console series-s`, native `1920x1080` output @ `0.50` internal scale (`960x540` -> `1080p` temporal upscaler), ray tracing off
+- **Profile:** `--console series-s`, ray tracing off (`diag` profile for telemetry; release builds enable Thin LTO + `codegen-units = 1`)
 
 | Configuration | Result | Notes |
 |---|---|---|
 | Unmodified upstream baseline on this laptop | ~5.4 FPS, ~40 GB RAM pressure | 61.9 s residency stall, black opaque wall tiles on NVIDIA Wave32 |
-| Tuned `VICTORY_RENDER_SCALE=0.45` | **22.7 FPS max** | Peak world framerate |
-| Tuned `VICTORY_RENDER_SCALE=0.50` (`1080p`) | **15.9 FPS median** | Baked default resolution/scale preset |
-| **30-Minute Continuous Endurance (`1800 s`, baked defaults, zero overrides)** | **15.1 FPS median** (mean `14.76`, p99 `16.0`, max `16.3`) | **0 crashes, 0 errors, 27,038 frames rendered** |
+| **30-Min Endurance (`1080p @ 0.50`, Cycle 9 `diag`, zero overrides)** | **15.1 FPS median** (mean `14.76`, p99 `16.0`, max `16.3`) | **0 crashes, 0 errors, 27,038 frames**; 5-min windows `15.20 / 15.00 / 15.20 / 15.10 / 14.90` FPS (1% low `13.8–14.5`) |
+| Tuned `1080p` (`VICTORY_RENDER_SCALE=0.45`, Cycle 7E) | **22.7 FPS max** (`15.3` median) | Peak `1080p` output framerate |
+| **Wave 11 (`1600x900 @ 0.50`, `diag`, `lto=false`)** | **14.7 FPS median / 18.0 max / 7.19 p1_low** | Intro **49.2 FPS**; crisp `900p` output, 2.8x higher 1% low |
+| **Wave 11 Default (`1280x720 @ 0.60`, `diag`, `lto=false`)** | **15.8 FPS median / 19.8 max / 16.0–17.1 steady** | **41.0% mean GPU, 5,242 MiB VRAM**; CPU `submit` (~41–60 ms) is now the sole ceiling toward 30 FPS |
+| **Wave 11 Native Release (`180 s` intro/menu check)** | **~58.8 FPS** (`4096 -> 8192` frames in `69.7 s`) | `hits=2304 misses=4`, `loaded=1981` pipelines, 0 crashes/errors |
 
-### 30-Minute Steady-State Windows (`t = 180..1805 s`)
+### 30-Minute Steady-State Windows (`1080p @ 0.50` Endurance, `t = 180..1805 s`)
 
 | Metric | Measured Range Across 5-Min Windows |
 |---|---|
@@ -29,8 +31,6 @@ An Xbox Series X|S (Scarlett) compatibility layer for Windows, forked from [avat
 | Private System RAM | `16,144 – 16,282 MB` (flat, no spill) |
 | Peak GPU Temperature | `82.0 °C` |
 
-> **Cycle 10 integrated (awaiting next plugged-in live run):** Merged upstream `VICTORY_PORT_GUARD=1` (64 KiB block claims) & `VICTORY_PORT_JOURNAL=1` (64-shard `Notes` combined with our `Shard::coarse` 16 MiB buckets), plus `VICTORY_TABLE_STAGES=1` (`stage_spans`), `SHARED_SPARE` 48 MiB upload buffer pool, and `WIDE_JOB = 256 KiB` (`454/454` unit tests passing in `victory-gpu` + `victory-loader`).
-
 ---
 
 ## NVIDIA, 8 GB VRAM & 16 GB RAM Optimizations
@@ -39,13 +39,14 @@ Every optimization below lives in Rust source code and is enabled safely in defa
 
 | Area | Implementation | Effect |
 |---|---|---|
-| **Write-Watch & Constant Echo** | Unwatched 4 KiB diffing (`shadow.rs`) + `placed_cb_pool` (`list.rs`, `host/place.rs`) + lock-free ranged `Shadow` seqlock | Eliminates ~21 MiB/frame unwatched card-echo copy loops & `BEHIND_PLACED` stalls |
-| **Sharded Journal & Coarse Skips** | 64-shard `Notes` with `Shard::coarse` 16 MiB bitmasks + `VICTORY_PORT_GUARD=1` / `VICTORY_PORT_JOURNAL=1` (`watch.rs`, `host.rs`) | Combines upstream's lock-sharded guards/journals with O(1) coarse bucket skipping |
-| **Submission & Descriptor Hot Paths** | Fused single-pass `Batch::refresh_front` (`CHUNK=128`), O(1) `stale_under_flights` skip, zero-alloc `card_steps::plan`, `u64` `port_descriptors::take`, `VICTORY_TABLE_STAGES=1` (`host.rs`, `host/card_steps.rs`, `port_descriptors.rs`, `draw.rs`) | Cuts per-frame CPU overhead across refresh, barrier, and descriptor scans |
-| **NVIDIA Wave32 & Shader Fixes** | `VICTORY_LDS_FLAGS=0`, `VICTORY_RAW_STRUCTURED=0`, `VICTORY_WAIT_RESIDENT=0`, `VICTORY_SHADER_LOOP_LIMITS`, BVH miss short-circuit (`intersect.rs`), `clear_air` NaN scrub (`ambient.rs`), R8 video plane fix (`texture.rs`) | Fixes black wall tiles on Wave32, eliminates 61.9 s residency stall, reduces heavy pass GPU load (-21.1 pts) |
-| **Native Temporal Upscaler** | Custom TAAU/reconstruction pipeline + `VICTORY_RENDER_SCALE` + `VICTORY_OUTPUT` (`upscale.rs`) | Renders at configurable internal scale (`0.50` default -> `1920x1080`) for 8 GB VRAM cards |
-| **8 GB VRAM & 16 GB RAM Caps** | Dynamic `spares()` VRAM cap, `SHARED_SPARE` 48 MiB pool, `WIDE_JOB=256 KiB` (`host.rs`, `pool.rs`), bounded `HostList` retention (`BURY_LAG=12`, `LIST_POOL_MAX=512`), `VICTORY_POOL_SMALL=1`, `VICTORY_D3D12_DRED=0` | Keeps memory flat (~5.3 GiB VRAM / ~16.2 GB RAM) without OOM paging stalls |
-| **Windows 11 Laptop Responsiveness** | Dedicated DXGI GPU selection (`high_performance_adapter`), `VICTORY_PROCESS_PRIORITY=normal`, capped low-priority DirectStorage workers (`dstorage.rs`, `lifecycle.rs`), low-priority pipeline workers, occluded telemetry in `Meter::record_present` (`queue.rs`) | Eliminates OS/cursor freezes during loading & shader compilation on 16 GB laptops |
+| **Submission-Prelude Textures** | `PreludeUpload` & `HostList::prelude(&uploads)` (`texture.rs`, `host.rs`) | Refreshes & uploads modified textures on the command list's prelude right before draw execution, fixing texture flicker/popping & stale video-ring frames |
+| **Mip & VRAM Texture Capping** | `from_base(desc, base, own_mips)` (`descriptor/host.rs`) + `over_cap()` / `VICTORY_TEXTURE_MAX` (`resource.rs`) + `room_lately()` gating | Prevents out-of-bounds mip views on arrays/streamed textures and caps peak texture mips dynamically (`1024`/`512`/`256`) at high VRAM pressure |
+| **Wave32 & Ambient Lighting Fixes** | `VICTORY_LDS_FLAGS=0`, `VICTORY_RAW_STRUCTURED=0`, `VICTORY_WAIT_RESIDENT=0`, magenta/NaN probe scrub in `ambient::raise` + `clear_air` (`ambient.rs`), tightened `VICTORY_SHADER_LOOP_LIMITS`, `BVH_MISS=1`, R8 video plane fix (`texture.rs`) | Fixes black cinderblock wall tiles on Wave32, cleans stale magenta/NaN light probes, removes 61.9 s residency stall, cuts GPU shader cost |
+| **Capped-Heap Dynamic Slots** | `dynamic_slots_capped` honoring `VICTORY_DYNAMIC_SLOTS=499999` (`descriptor/host.rs`) | Expands dynamic table slots from `262k` to `499,999` on NVIDIA's 1M descriptor heap |
+| **Write-Watch & Sharded Journal** | Unwatched 4 KiB diffing (`shadow.rs`), `placed_cb_pool` (`list.rs`, `host/place.rs`), lock-free ranged `Shadow` seqlock, 64-shard `Notes` + 16 MiB `Shard::coarse` + coalesced `VirtualProtect` in `unguard` (`watch.rs`), `VICTORY_PORT_GUARD=1`, `VICTORY_PORT_JOURNAL=1` | Eliminates ~21 MiB/f echo copies & `BEHIND_PLACED` stalls while cutting guard/journal waits and kernel protect calls |
+| **Submission & Upload Hot Paths** | Fused `Batch::refresh_front` (`CHUNK=128`), `SHARED_SPARE` 48 MiB pool, `WIDE_JOB=256 KiB` (`word_runs_put_avx2`), `VICTORY_TABLE_STAGES=1` (`draw.rs`), zero-alloc `card_steps::plan`, `u64` `port_descriptors::take`, `codegen-units=1` + Thin LTO (`Cargo.toml`) | Trims submission thread overhead across refreshes, barriers, descriptor scans, and uploads |
+| **Native Temporal Upscaler** | Custom TAAU/reconstruction pipeline (`upscale.rs`), default `1280x720 @ 0.60` + `VICTORY_FRAME_INTERVAL_MS=16.667` | Smooth 720p TAAU output with large GPU headroom (`41%` GPU, `5.2 GiB` VRAM) and unlocked 60 FPS menus/intro |
+| **8 GB VRAM & 16 GB RAM Laptops** | Dedicated DXGI GPU selection (`high_performance_adapter`), `VICTORY_PROCESS_PRIORITY=normal`, capped low-priority DirectStorage workers (`dstorage.rs`, `lifecycle.rs`), `VICTORY_PIPELINE_WORKERS=6` lowest priority, `BURY_LAG=12`, `LIST_POOL_MAX=512`, `VICTORY_POOL_SMALL=1`, `VICTORY_D3D12_DRED=0` | Eliminates Windows 11 OS/mouse freezes and keeps commit/VRAM flat |
 
 ---
 
@@ -77,8 +78,9 @@ This repository builds directly upon the upstream open-source ecosystem and keep
 
 - **[Marvisak/VIctory](https://github.com/Marvisak/VIctory)** — Core loader, HLE runtime services, D3D12 translation backend, and DXIL shader recompiler
 - **[avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX)** — Thin list parallel engine (`VICTORY_THIN`), async submit/present, AVX2 landing, renderer ports 1–7, `VICTORY_OUTPUT`, and `VICTORY_AMBIENT_SETTLE`
+- **[Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD)** — Submission-prelude texture uploads (`5d6bd84`), streamed mip clamping, dynamic VRAM `over_cap`, magenta ambient probe filtering, and release `codegen-units = 1` (`e942896`)
 - **[fxceless/victory-fork](https://github.com/fxceless/victory-fork)** — Community fork base and pull requests
 - **[trustno1-coder/VIctory-NVIDIA](https://github.com/trustno1-coder/VIctory-NVIDIA)** — NVIDIA Wave32 compatibility findings and VRAM/descriptor fixes
-- **[deynesdev/Protonida](https://github.com/deynesdev/Protonida)** — `stage_spans` table-stage filtering (`VICTORY_TABLE_STAGES`)
-- **[lepotane/VIctory-leonida](https://github.com/lepotane/VIctory-leonida)** — `SHARED_SPARE` upload pool and `WIDE_JOB` improvements
-- **Additional upstream contributors:** `DexNom/VIctory`, `Belobug/VIctory-Belobug-AMD`, `FQY55kai/ZJOU-VICTORY`, `myokex/victory-amd`, `Geckomacabre`, `cxy0072019-sketch`, and `ivall/xcl` (architectural reference only; no GPL code included).
+- **[deynesdev/Protonida](https://github.com/deynesdev/Protonida)** — `stage_spans` table-stage filtering (`VICTORY_TABLE_STAGES`) and coalesced `VirtualProtect` (`fab7fda`)
+- **[lepotane/VIctory-leonida](https://github.com/lepotane/VIctory-leonida)** — Capped-heap `VICTORY_DYNAMIC_SLOTS`, `SHARED_SPARE` upload pool, and `WIDE_JOB` improvements (`c6c9da9`)
+- **Additional upstream contributors:** `DexNom/VIctory`, `FQY55kai/ZJOU-VICTORY`, `myokex/victory-amd`, `Geckomacabre`, `cxy0072019-sketch`, and `ivall/xcl` (architectural reference only; no GPL code included).

@@ -317,15 +317,18 @@ fn apply_runtime_defaults() {
     set_default("VICTORY_SKIP_PIPELINES", "none");
     set_default("VICTORY_OWN_UPSCALER", "1");
     set_default("VICTORY_BVH_MISS", "1");
-    set_default("VICTORY_SHADER_LOOP_LIMITS", "39f0e9aeb156a61c:64,8e614708143ef917:128");
+    set_default("VICTORY_SHADER_LOOP_LIMITS", "39f0e9aeb156a61c:32,8e614708143ef917:64,34fb51b8a0312e82:64");
     // Disable Wave32 LDS flag-region pass (PR #4) on NVIDIA: compiling 2cc4c197ee29e291
     // without full Wave64 LDS sync blacks out opaque lighting tiles on cinderblock walls.
     set_default("VICTORY_LDS_FLAGS", "0");
-    // Native 1080p output + 0.50 internal scale (960x540 -> 1920x1080 TAAU) for RTX 5060 8 GB laptop.
-    set_default("VICTORY_OUTPUT", "1920x1080");
-    set_default("VICTORY_RENDER_SCALE", "0.50");
-    // Pipeline compiler: low-priority background workers to prevent PC/mouse freezes during loading.
-    set_default("VICTORY_PIPELINE_WORKERS", "3");
+    // 720p@0.60 internal scale (768x432 -> 720p TAAU) + unlocked frame interval for RTX 5060 8 GB laptop.
+    set_default("VICTORY_OUTPUT", "1280x720");
+    set_default("VICTORY_RENDER_SCALE", "0.60");
+    set_default("VICTORY_FRAME_INTERVAL_MS", "16.667");
+    // Pipeline compiler: 6 low-priority background workers + extended NVIDIA 1M dynamic slots.
+    set_default("VICTORY_DYNAMIC_SLOTS", "499999");
+    set_default("VICTORY_PIPELINE_BOOK", "1");
+    set_default("VICTORY_PIPELINE_WORKERS", "6");
     set_default("VICTORY_PIPELINE_LOWEST", "1");
     // 16 GB RAM / 8 GB VRAM Laptop Memory Caps (prevents shared PC RAM spill & OOM freeze,
     // bounds HostList retention via shorter bury lag + matched pool cap, disables DRED book bloat).
