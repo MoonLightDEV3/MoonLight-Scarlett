@@ -645,10 +645,9 @@ pub(crate) fn title_written(texture: &ID3D12Resource) -> bool {
     unsafe { texture.GetDesc() }.Flags.0 & TARGET_DEPTH_UNORDERED == 0
 }
 
-/// Records, once per list, the copy of `resource`'s staging buffer into
-/// its host copy, and the detiling that refreshes the staging buffer at
-/// submission if the memory changed. Leaves the texture in the copy
-/// destination state.
+/// Registers, once per list, `resource`'s staging buffer so that at submission
+/// time its memory is refreshed and, if changed (or never uploaded), copied
+/// into its host texture on the list's prelude command list.
 pub(crate) fn upload(list: &HostList, resource: This, _texture: &ID3D12Resource) {
     upload_from(list, resource, 0);
 }
@@ -834,6 +833,11 @@ pub(crate) struct PreludeUpload {
 }
 
 impl PreludeUpload {
+    /// The title memory the texture is read from: address and bytes.
+    #[allow(dead_code)]
+    pub(crate) fn memory(&self) -> (usize, usize) {
+        self.staging.memory()
+    }
     /// Called on the submitting thread after `self.staging.refresh()` has
     /// completed for this submission. Returns `Some(first_upload)` when the
     /// list's prelude must record `CopyTextureRegion` into `self.copy.texture`.
@@ -2069,13 +2073,21 @@ mod prelude_upload_tests {
         let uploaded = AtomicBool::new(false);
         let dirty = AtomicBool::new(true);
 
+        // Frame 1: first upload runs after refresh() detiled into staging.
         assert_eq!(claim_upload(&uploaded, &dirty), Some(true));
-        assert_eq!(claim_upload(&uploaded, &dirty), None);
+        // Second list in the same submission skips redundant copy.
         assert_eq!(claim_upload(&uploaded, &dirty), None);
 
+        // Frame 2: texture unchanged — refresh() does not detile, prelude skips.
+        assert_eq!(claim_upload(&uploaded, &dirty), None);
+
+        // Frame 3: texture changed — refresh()/detile() runs BEFORE claim_upload,
+        // so upload is claimed on the exact same frame (0 frames late).
         dirty.store(true, Release);
         assert_eq!(claim_upload(&uploaded, &dirty), Some(false));
 
+        // Frame 4: consecutive change (e.g. refresh_front() on every frame)
+        // must also upload immediately, never alternating upload/skip.
         dirty.store(true, Release);
         assert_eq!(claim_upload(&uploaded, &dirty), Some(false));
     }
@@ -2086,16 +2098,18 @@ mod prelude_upload_tests {
             std::array::from_fn(|_| (AtomicBool::new(false), AtomicBool::new(true)));
         let mut gpu_frame = [0u32; 3];
 
+        // 12 decoded frames cycling through the 3-buffer ring (like Bink intro),
+        // with frame 5 repeated once to exercise the clean-frame transition.
         let schedule = [
             (0, 1, true),
             (1, 2, true),
             (2, 3, true),
             (0, 4, true),
             (1, 5, true),
-            (1, 5, false),
+            (1, 5, false), // held frame: unchanged
             (2, 6, true),
             (0, 7, true),
-            (1, 8, true),
+            (1, 8, true),  // immediately after held frame: must NOT be stale!
             (2, 9, true),
             (0, 10, true),
             (1, 11, true),

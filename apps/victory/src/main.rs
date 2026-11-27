@@ -274,7 +274,7 @@ fn apply_runtime_defaults() {
     set_default("VICTORY_LANE_CORE", "1");
     set_default("VICTORY_UP_QUEUE", "0");
     set_default("VICTORY_WAIT_RESIDENT", "0");
-    set_default("VICTORY_JOIN_PARTS", "8");
+    set_default("VICTORY_JOIN_PARTS", "1");
     set_default("VICTORY_RELAY", "2");
     set_default("VICTORY_WIDE_BACK", "1");
     set_default("VICTORY_WIDE_SPIN", "80");
@@ -286,6 +286,7 @@ fn apply_runtime_defaults() {
     set_default("VICTORY_JOIN_BARRIERS", "1");
     set_default("VICTORY_CARD_REHASH_RUNS", "1");
     set_default("VICTORY_JOIN_COPIES", "1");
+    set_default("VICTORY_UNDER_FUSED", "0");
     set_default("VICTORY_INDIRECT_WINDOW", "1");
     set_default("VICTORY_INDIRECT_BATCH", "2");
     set_default("VICTORY_MAP_THREADS", "1");
@@ -309,12 +310,25 @@ fn apply_runtime_defaults() {
     set_default("VICTORY_CARD_AWAKE", "0");
     set_default("VICTORY_UPLOAD_AHEAD", "1");
     set_default("VICTORY_TEXTURE_NO_WAIT", "1");
+    // Wave 13: async GPU flight queue (2 frames), async texback writer, early table reclaim,
+    // NaN scrub + SH ambient stability, single-wait pipelines, port constants order, fair texture queue.
+    set_default("VICTORY_SUBMIT_FRAMES", "2");
+    set_default("VICTORY_TEXBACK_ASYNC", "1");
+    set_default("VICTORY_EARLY_TABLES", "1");
+    set_default("VICTORY_NAN_SCRUB", "1");
+    set_default("VICTORY_PIPELINE_WAIT_ONCE", "1");
+    set_default("VICTORY_PORT_CONSTANTS_ORDER", "1");
+    set_default("VICTORY_FAIR_DUE", "1");
     // Visuals, lighting & non-black textures/skin: directional SH GI + keep-shown fallback.
-    set_default("VICTORY_AMBIENT", "0.8");
+    set_default("VICTORY_AMBIENT", "1.1");
     set_default("VICTORY_AMBIENT_AIR", "1.5");
+    set_default("VICTORY_AMBIENT_FLOOR", "0.22");
+    set_default("VICTORY_AMBIENT_DARK", "0.55");
+    set_default("VICTORY_AMBIENT_MOST", "2");
     set_default("VICTORY_KEEP_SHOWN", "1");
     set_default("VICTORY_SHOW_AFTER", "1");
     set_default("VICTORY_SKIP_PIPELINES", "none");
+    set_default("VICTORY_RAYMARCHED_LOCAL_LIGHTS", "0");
     set_default("VICTORY_OWN_UPSCALER", "1");
     set_default("VICTORY_BVH_MISS", "1");
     set_default("VICTORY_SHADER_LOOP_LIMITS", "39f0e9aeb156a61c:32,8e614708143ef917:64,34fb51b8a0312e82:64");
@@ -325,8 +339,9 @@ fn apply_runtime_defaults() {
     set_default("VICTORY_OUTPUT", "1920x1080");
     set_default("VICTORY_RENDER_SCALE", "0.50");
     set_default("VICTORY_FRAME_INTERVAL_MS", "16.667");
-    // Pipeline compiler: 6 low-priority background workers + extended NVIDIA 1M dynamic slots.
-    set_default("VICTORY_DYNAMIC_SLOTS", "499999");
+    // Keep <= 262144 on NVIDIA 1M-capped view heaps to preserve bindless slots 500k..737k;
+    // VICTORY_EARLY_TABLES=1 keeps 0 table allocation failures.
+    set_default("VICTORY_DYNAMIC_SLOTS", "262144");
     set_default("VICTORY_PIPELINE_BOOK", "1");
     set_default("VICTORY_PIPELINE_WORKERS", "6");
     set_default("VICTORY_PIPELINE_LOWEST", "1");
@@ -345,7 +360,7 @@ fn apply_runtime_defaults() {
     set_default("VICTORY_TEXTURE_BUDGET_MB", "1024");
     // Keep 4 KiB sub-64 KiB texture packing to avoid 3.3x VRAM bloat on 8 GB GPUs.
     set_default("VICTORY_POOL_SMALL", "1");
-    set_default("VICTORY_TEXTURE_ROOM_PERCENT", "80");
+    set_default("VICTORY_TEXTURE_ROOM_PERCENT", "88");
     set_default("VICTORY_TEXTURE_STAGE_MB", "32");
     set_default("VICTORY_TEXTURE_KEEP", "0");
     set_default("VICTORY_INPLACE", "0");

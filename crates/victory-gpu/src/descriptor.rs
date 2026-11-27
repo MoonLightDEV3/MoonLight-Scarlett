@@ -751,6 +751,7 @@ static SYNC_SPLIT: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomi
 #[cfg(windows)]
 pub(crate) fn sync_line(frames: f64) {
     crate::port_descriptors::line(frames);
+    crate::draw::in_place_indirect_line(frames);
     let [twins, moved, lost] = [0, 1, 2].map(|i| host::TWINS[i].swap(0, std::sync::atomic::Ordering::Relaxed));
     if twins > 0 {
         tracing::info!(
@@ -856,15 +857,18 @@ pub(crate) fn with_heap<T>(heap: usize, f: impl FnOnce(&Heap) -> T) -> Option<T>
 }
 
 /// Gives back dynamic slots of the host heap behind the title heap at
-/// `heap`, if that heap still exists.
+/// `heap`, if that heap is still there and `id` says it is the one that took
+/// them ([`host::HostHeap::id`]): the title can release the heap a list's
+/// slots came from, and a later heap can be made at the same address before
+/// the list is reset.
 #[cfg(windows)]
-pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
+pub(crate) fn release_dynamic(heap: usize, id: u64, first: u32, n: u32) {
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     if heaps.iter().any(|&(_, _, h)| h == heap)
         // SAFETY: registered heaps are live (removed when dropped).
         && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
     {
-        host.release(first, n);
+        host.release(id, first, n);
     }
 }
 
@@ -2142,5 +2146,74 @@ mod tests {
                 "shape {id} across chunk boundary"
             );
         }
+    }
+
+    /// A table made afresh for a draw holds the descriptors its shader
+    /// moves halves through (`HostShader::half_views`), also past the range
+    /// starts its used-resource entries give: with one entry for a range
+    /// from dword 0 and a 16-bit float buffer view at dword 8, the table
+    /// takes two dynamic slots, so the next allocation does not land on the
+    /// view's.
+    #[cfg(windows)]
+    #[test]
+    fn a_fresh_table_holds_the_half_views_past_its_range_starts() {
+        use victory_shader::{ResourceType, RootType, UsedResource};
+        let Some(device) = crate::host::host() else {
+            return; // no host GPU
+        };
+        let list = device.new_list().expect("a host list");
+        let desc = HeapDesc {
+            kind: VIEWS_KIND,
+            count: 2,
+            flags: SHADER_VISIBLE,
+            nodes: 1,
+        };
+        let none = Placement {
+            address: 0,
+            size: 0,
+        };
+        let mut h: This = std::ptr::null();
+        assert_eq!(create(desc, none, &mut h), S_OK);
+        let title = heap(h);
+        let host_heap = title.host().expect("a host view heap");
+        let (first, second) = (title.handle(0).unwrap(), title.handle(1).unwrap());
+        // An R16G16B16A16_FLOAT buffer view of memory in the second slot.
+        let memory = [0u64; 64];
+        let address = memory.as_ptr() as u64;
+        let resource = [1, 0, 0, 0, 512, 0, 1, 0x1_0001, 0, 1, 0, 1, 0, 0];
+        let mut words = [0u32; 16];
+        words[..10].copy_from_slice(&[10, 1, 5768, 0, 0, 0, 64, 0, 0, 0]);
+        words[10] = address as u32;
+        words[11] = (address >> 32) as u32;
+        create_placed_srv(std::ptr::null(), &resource, &words, second);
+        assert!(view(second).as_ref().and_then(host::half_view).is_some());
+        let mut state = crate::draw::State::default();
+        state.set_heaps(&[h]);
+        state.set_table(true, 1, first);
+        let range = UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 8,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        };
+        let plan = crate::draw::TablePlan::new(&[range], &[]);
+        let made = state.tables(&list, &plan, true, &[], &[(1, 8)]);
+        let [(1, offset)] = made[..] else {
+            panic!("one fresh table for root parameter 1, not {:?}", &made[..]);
+        };
+        assert_ne!(offset, u32::MAX, "the table found no dynamic slots");
+        let next = host_heap.dynamic(1).expect("a dynamic slot");
+        host_heap.release(host_heap.id(), next, 1);
+        drop(state);
+        slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
+        assert_eq!(
+            next,
+            offset / 32 + 2,
+            "the next allocation took the table's second slot"
+        );
     }
 }

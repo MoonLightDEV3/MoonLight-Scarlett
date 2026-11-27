@@ -221,17 +221,20 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         _ => None,
     });
     let stores_by_address = programs.is_empty() || programs.iter().any(stores_by_address);
-    let used = programs
-        .into_iter()
-        .find(|p| {
-            matches!(
-                p.stage,
-                HwStage::Vs | HwStage::Ps | HwStage::Ms | HwStage::Cs
-            )
-        })
-        .map(|p| p.used)
-        .unwrap_or_default();
-    let tables = crate::draw::TablePlan::new(&used, &host.root_indexed_views);
+    let chosen = programs.iter().find(|p| {
+        matches!(
+            p.stage,
+            HwStage::Vs | HwStage::Ps | HwStage::Ms | HwStage::Cs
+        )
+    });
+    let used = chosen.map(|p| p.used.to_vec()).unwrap_or_default();
+    let (used_written, mut write_unknown) = chosen
+        .map(|p| written_used(p, &used))
+        .unwrap_or((Vec::new(), !programs.is_empty()));
+    if programs.len() > 1 {
+        write_unknown = true;
+    }
+    let tables = crate::draw::TablePlan::with_written(&used, &host.root_indexed_views, &used_written, write_unknown);
     Ok(Translated {
         host,
         threads,
@@ -429,7 +432,7 @@ struct Pipeline {
     /// One of the ray-tracing structure builder's ([`Builder`]).
     #[cfg(windows)]
     builder: bool,
-    /// Precomputed skip status from `VICTORY_SKIP_PIPELINES`.
+    /// Precomputed skip status from `VICTORY_SKIP_PIPELINES` / `VICTORY_SKIP_RT=1`.
     #[cfg(windows)]
     skipped: bool,
 }
@@ -468,6 +471,21 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
         return None;
     }
     make::ready(&pipeline(this).host)
+}
+
+/// As [`host_pipeline`], for a draw into views of the formats `bound`: if one
+/// has another format than the pipeline declares for its slot, the host
+/// pipeline made for the bound formats.
+#[cfg(windows)]
+pub(crate) fn host_pipeline_for<'a>(this: This, bound: &host::TargetFormats) -> Option<&'a host::HostPipeline> {
+    if this.is_null() {
+        return None;
+    }
+    let p = &pipeline(this).host;
+    if p.formats != *bound && host::formats_differ(&p.formats, bound) {
+        return make::for_formats(p, bound);
+    }
+    make::ready(p)
 }
 
 /// Host pipelines queued and not made yet.
@@ -539,6 +557,71 @@ fn skipped_shader(p: &Pipeline) -> Option<&str> {
 }
 
 #[cfg(windows)]
+fn skip_raymarched_local_lights(shaders: &[Arc<Shader>]) -> bool {
+    static SKIP: OnceLock<bool> = OnceLock::new();
+    let on = *SKIP.get_or_init(|| {
+        if std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1") {
+            return std::env::var_os("VICTORY_RAYMARCHED_LOCAL_LIGHTS").is_some_and(|v| v == "0");
+        }
+        std::env::var_os("VICTORY_RAYMARCHED_LOCAL_LIGHTS").is_none_or(|v| v == "0")
+    });
+    if !on {
+        return false;
+    }
+    const NEEDLE: &[u8] = b"CS_GatherRaymarchedLocalLightsClassified";
+    shaders
+        .iter()
+        .any(|s| s.container.windows(NEEDLE.len()).any(|w| w == NEEDLE))
+}
+
+#[cfg(windows)]
+fn written_used(
+    program: &victory_shader::NativeProgram,
+    used: &[victory_shader::UsedResource],
+) -> (Vec<bool>, bool) {
+    use victory_shader::gfx10::{Encoding, Fields, Operand, decode};
+    let Ok(code) = decode(&program.code) else {
+        return (vec![true; used.len()], true);
+    };
+    let mut written = vec![false; used.len()];
+    let mut unknown = false;
+    for inst in code.iter() {
+        let is_store = match inst.encoding {
+            Encoding::Mubuf | Encoding::Mtbuf | Encoding::Smem => {
+                inst.name().is_none_or(|n| n.contains("store") || n.contains("atomic"))
+            }
+            _ => false,
+        };
+        if !is_store {
+            continue;
+        }
+        let fields = inst.fields(program.wave64);
+        let descriptor = match &fields {
+            Fields::Buffer { rsrc, .. } => Some(rsrc),
+            Fields::Smem { base, .. } => Some(base),
+            _ => None,
+        };
+        let Some(Operand::Scalar { code, .. }) = descriptor else {
+            unknown = true;
+            continue;
+        };
+        let mut hit = false;
+        for (i, resource) in used.iter().enumerate() {
+            if resource.kind == victory_shader::ResourceType::Uav
+                && resource.lower_bound == u32::from(*code)
+            {
+                written[i] = true;
+                hit = true;
+            }
+        }
+        if !hit {
+            unknown = true;
+        }
+    }
+    (written, unknown)
+}
+
+#[cfg(windows)]
 pub(crate) fn is_skipped(this: This) -> bool {
     !this.is_null() && pipeline(this).skipped
 }
@@ -598,7 +681,7 @@ fn hand_out(
 ) -> HRESULT {
     tracing::trace!(?shaders, "pipeline state");
     #[cfg(windows)]
-    let skipped = matches_skip(&shaders, skip_set()).is_some();
+    let skipped = matches_skip(&shaders, skip_set()).is_some() || skip_raymarched_local_lights(&shaders);
     #[cfg(windows)]
     let host = Arc::new(make::Pending::new(shaders.clone(), graphics));
     #[cfg(windows)]
@@ -843,6 +926,51 @@ mod tests {
 
     use super::*;
     use crate::object::{S_OK, slot};
+
+    #[cfg(windows)]
+    #[test]
+    fn a_store_marks_only_the_table_descriptor_it_names() {
+        let program = victory_shader::NativeProgram {
+            stage: victory_shader::HwStage::Cs,
+            wave64: false,
+            vgprs: 32,
+            layout: Vec::new(),
+            used: vec![victory_shader::UsedResource {
+                kind: victory_shader::ResourceType::Uav,
+                root: victory_shader::RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 1,
+                dwords: 4,
+                user_data: 0,
+                slot: 0,
+            }],
+            io: victory_shader::native::StageIo::Cs(victory_shader::native::ComputeIo {
+                rsrc2: 0,
+                threads: [64, 1, 1],
+            }),
+            code: [
+                0xE078_1000u32, // buffer_store_dwordx4 v[4:7], v1, s[0:3], 0 offen
+                0x8000_0401,
+                0xBF81_0000, // s_endpgm
+            ]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect(),
+        };
+        let (written, unknown) = super::written_used(&program, &program.used);
+        assert_eq!(written, [true]);
+        assert!(!unknown);
+
+        let mut load = program;
+        load.code = [0xBF81_0000u32] // s_endpgm
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect();
+        let (written, unknown) = super::written_used(&load, &load.used);
+        assert_eq!(written, [false]);
+        assert!(!unknown);
+    }
 
     fn shaders(p: This) -> Vec<(&'static str, Vec<u8>)> {
         pipeline(p)

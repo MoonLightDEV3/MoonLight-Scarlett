@@ -9,7 +9,7 @@
 #![allow(clippy::too_many_arguments)]
 
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
@@ -19,8 +19,9 @@ use windows_sys::Win32::Graphics::Gdi::{
     MONITORINFO, MonitorFromPoint, MonitorFromWindow,
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
-use windows_sys::Win32::UI::Input as raw_input;
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_F8, VK_F11, VK_MENU, VK_RETURN};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+    VK_ESCAPE, VK_F2, VK_F8, VK_F11, VK_MENU, VK_RETURN,
+};
 use windows_sys::Win32::UI::WindowsAndMessaging::{self as wm, HMENU};
 use windows_sys::core::{PCSTR, PCWSTR, w};
 
@@ -436,8 +437,7 @@ fn fit_into(area: &RECT, width: i32, height: i32) -> (i32, i32) {
 static CURSOR_HIDDEN: AtomicBool = AtomicBool::new(false);
 static MOUSE_CAPTURED: AtomicBool = AtomicBool::new(false);
 static WAIT_LMB_UP: AtomicBool = AtomicBool::new(false);
-static MOUSE_DX: AtomicI32 = AtomicI32::new(0);
-static MOUSE_DY: AtomicI32 = AtomicI32::new(0);
+static CAPTURED_HWND: AtomicUsize = AtomicUsize::new(0);
 
 pub(crate) fn set_cursor_hidden(hidden: bool) {
     CURSOR_HIDDEN.store(hidden, Ordering::Relaxed);
@@ -456,11 +456,8 @@ pub(crate) fn mouse_lmb_suppressed() -> bool {
     WAIT_LMB_UP.load(Ordering::Relaxed)
 }
 
-pub(crate) fn take_mouse_delta() -> (i32, i32) {
-    (
-        MOUSE_DX.swap(0, Ordering::Relaxed),
-        MOUSE_DY.swap(0, Ordering::Relaxed),
-    )
+pub(crate) fn captured_hwnd() -> HWND {
+    CAPTURED_HWND.load(Ordering::Relaxed) as HWND
 }
 
 fn arrow_cursor() -> wm::HCURSOR {
@@ -508,50 +505,44 @@ fn clip_to_client(hwnd: HWND) {
     }
 }
 
+fn center_cursor(hwnd: HWND) {
+    let mut rect = RECT::default();
+    // SAFETY: `rect` receives client bounds on the window thread.
+    if unsafe { wm::GetClientRect(hwnd, &mut rect) } == 0 {
+        return;
+    }
+    let mut center = POINT {
+        x: (rect.left + rect.right) / 2,
+        y: (rect.top + rect.bottom) / 2,
+    };
+    // SAFETY: converts client center to screen coordinates and centers pointer immediately.
+    unsafe {
+        if ClientToScreen(hwnd, &mut center) != 0 {
+            wm::SetCursorPos(center.x, center.y);
+        }
+    }
+}
+
 fn capture_mouse(hwnd: HWND, suppress_lmb: bool) {
-    MOUSE_DX.store(0, Ordering::Relaxed);
-    MOUSE_DY.store(0, Ordering::Relaxed);
+    CAPTURED_HWND.store(hwnd as usize, Ordering::Relaxed);
     WAIT_LMB_UP.store(suppress_lmb, Ordering::Relaxed);
     MOUSE_CAPTURED.store(true, Ordering::Relaxed);
     set_cursor_hidden(true);
     // SAFETY: hides the cursor and clips pointer travel inside the game client area.
     unsafe { wm::SetCursor(std::ptr::null_mut()) };
     clip_to_client(hwnd);
+    center_cursor(hwnd);
 }
 
 fn release_mouse() {
     MOUSE_CAPTURED.store(false, Ordering::Relaxed);
     WAIT_LMB_UP.store(false, Ordering::Relaxed);
-    MOUSE_DX.store(0, Ordering::Relaxed);
-    MOUSE_DY.store(0, Ordering::Relaxed);
+    CAPTURED_HWND.store(0, Ordering::Relaxed);
     set_cursor_hidden(false);
     // SAFETY: unclips the pointer and restores the arrow cursor.
     unsafe {
         wm::ClipCursor(std::ptr::null());
         wm::SetCursor(arrow_cursor());
-    }
-}
-
-fn register_raw_mouse(hwnd: HWND) {
-    if !mouse_look_enabled() || !is_top_level(hwnd) {
-        return;
-    }
-    let device = raw_input::RAWINPUTDEVICE {
-        usUsagePage: 0x01,
-        usUsage: 0x02,
-        dwFlags: 0,
-        hwndTarget: hwnd,
-    };
-    // SAFETY: valid single-element RAWINPUTDEVICE slice targeting `hwnd`.
-    if unsafe {
-        raw_input::RegisterRawInputDevices(
-            &device,
-            1,
-            size_of::<raw_input::RAWINPUTDEVICE>() as u32,
-        )
-    } == 0
-    {
-        tracing::warn!("RegisterRawInputDevices failed for mouse look");
     }
 }
 
@@ -567,7 +558,6 @@ fn hook(hwnd: HWND) {
         wm::SetPropW(hwnd, TITLE_PROC, title as *mut c_void);
         wm::SetWindowLongPtrW(hwnd, wm::GWLP_WNDPROC, window_proc as *const () as isize);
     }
-    register_raw_mouse(hwnd);
 }
 
 extern "system" fn window_proc(
@@ -615,7 +605,7 @@ extern "system" fn window_proc(
         return 0;
     }
     if message == wm::WM_KEYDOWN
-        && wparam == usize::from(VK_F8)
+        && (wparam == usize::from(VK_F2) || wparam == usize::from(VK_F8))
         && (lparam & (1 << 30)) == 0
         && mouse_look_enabled()
     {
@@ -625,6 +615,13 @@ extern "system" fn window_proc(
             capture_mouse(hwnd, false);
         }
         return 0;
+    }
+    if message == wm::WM_KEYDOWN
+        && wparam == usize::from(VK_ESCAPE)
+        && (lparam & (1 << 30)) == 0
+        && mouse_captured()
+    {
+        release_mouse();
     }
     if message == wm::WM_SYSKEYDOWN && wparam == usize::from(VK_MENU) && mouse_captured() {
         release_mouse();
@@ -638,34 +635,6 @@ extern "system" fn window_proc(
     }
     if (message == wm::WM_SIZE || message == wm::WM_MOVE) && mouse_captured() {
         clip_to_client(hwnd);
-    }
-    if message == wm::WM_INPUT && mouse_captured() {
-        // SAFETY: stack buffer zeroed before `GetRawInputData` populates it.
-        let mut raw: raw_input::RAWINPUT = unsafe { std::mem::zeroed() };
-        let mut size = size_of::<raw_input::RAWINPUT>() as u32;
-        // SAFETY: `lparam` is a valid `HRAWINPUT` during `WM_INPUT`.
-        let got = unsafe {
-            raw_input::GetRawInputData(
-                lparam as raw_input::HRAWINPUT,
-                raw_input::RID_INPUT,
-                (&raw mut raw).cast(),
-                &mut size,
-                size_of::<raw_input::RAWINPUTHEADER>() as u32,
-            )
-        };
-        if got != u32::MAX && raw.header.dwType == raw_input::RIM_TYPEMOUSE {
-            // SAFETY: `dwType == RIM_TYPEMOUSE` selects the `mouse` union arm.
-            let mouse = unsafe { &raw.data.mouse };
-            if (mouse.usFlags & raw_input::MOUSE_MOVE_ABSOLUTE) == 0 {
-                if mouse.lLastX != 0 {
-                    MOUSE_DX.fetch_add(mouse.lLastX, Ordering::Relaxed);
-                }
-                if mouse.lLastY != 0 {
-                    MOUSE_DY.fetch_add(mouse.lLastY, Ordering::Relaxed);
-                }
-            }
-        }
-        return 0;
     }
     // Console titles register WNDCLASS with hCursor = NULL and ignore WM_SETCURSOR,
     // leaving Windows' launch/busy blue spinner stuck over the client area.
@@ -1092,12 +1061,18 @@ mod tests {
     }
 
     #[test]
-    fn mouse_delta_drains_and_resets() {
-        let _ = take_mouse_delta();
-        MOUSE_DX.fetch_add(12, Ordering::Relaxed);
-        MOUSE_DY.fetch_add(-7, Ordering::Relaxed);
-        assert_eq!(take_mouse_delta(), (12, -7));
-        assert_eq!(take_mouse_delta(), (0, 0));
+    fn mouse_capture_tracks_hwnd_and_release_resets_it() {
+        release_mouse();
+        assert!(!mouse_captured());
+        assert!(captured_hwnd().is_null());
+        let dummy = 0x1234usize as HWND;
+        CAPTURED_HWND.store(dummy as usize, Ordering::Relaxed);
+        MOUSE_CAPTURED.store(true, Ordering::Relaxed);
+        assert!(mouse_captured());
+        assert_eq!(captured_hwnd(), dummy);
+        release_mouse();
+        assert!(!mouse_captured());
+        assert!(captured_hwnd().is_null());
     }
 
     #[test]

@@ -381,7 +381,6 @@ pub(crate) fn texture_room() -> u64 {
 }
 
 /// For the memory line: blocks of textures and of staging buffers, in MiB.
-#[cfg(feature = "diagnostics")]
 pub(crate) fn memory() -> [u64; 2] {
     [lock(&TEXTURES).blocks() as u64 * (BLOCK >> 20), lock(&STAGING).blocks() as u64 * (BLOCK >> 20)]
 }
@@ -632,9 +631,19 @@ pub(crate) fn begun_before(texture: &ID3D12Resource) -> Option<u64> {
     unseen.get(&raw).copied().filter(|&begun| begun > finished)
 }
 
+/// Private data a texture allocated inside a pool block carries ([`give_back_with`]).
+const KEY: GUID = GUID::from_u128(0x6f0e2f0c_5a59_4b1e_9a3f_7f4d2c9be713);
+
+/// Whether `texture` was placed inside a pool block: committed textures
+/// (such as fallback allocations or upscaler targets) cannot take aliasing barriers.
+pub(crate) fn pooled(texture: &ID3D12Resource) -> bool {
+    let mut size = 0u32;
+    // SAFETY: queries interface size without writing any output data.
+    unsafe { texture.GetPrivateData(&KEY, &mut size, None).is_ok() }
+}
+
 /// Makes `texture` give `piece` back when the last reference to it goes.
 fn give_back_with(texture: &ID3D12Resource, piece: Piece) {
-    const KEY: GUID = GUID::from_u128(0x6f0e2f0c_5a59_4b1e_9a3f_7f4d2c9be713);
     let made = Box::into_raw(Box::new(Reclaim { methods: &RECLAIM.0, references: AtomicU32::new(1), piece }));
     // SAFETY: a COM object of ours with one reference, which this takes and
     // drops at the end; the texture takes its own.

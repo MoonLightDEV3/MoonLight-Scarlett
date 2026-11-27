@@ -168,14 +168,14 @@ pub(crate) fn available_physical_ram() -> Option<u64> {
 pub(crate) fn vram_keep(budget: u64, used: u64) -> (u64, u64) {
     const KEPT_MS: u64 = 600_000;
     const IDLE_MS: u64 = 5_000;
-    const SHORT_MS: u64 = 1_500;
+    const SHORT_MS: u64 = 3_000;
     if budget == 0 {
         return (IDLE_MS, u64::MAX);
     }
     let share = |percent: u64| budget / 100 * percent;
     if used < share(88) {
         (KEPT_MS, u64::MAX)
-    } else if used < share(95) {
+    } else if used < share(92) {
         (IDLE_MS, used - share(85))
     } else {
         (SHORT_MS, used - share(85))
@@ -1334,7 +1334,46 @@ mod tests {
 
 /// The batches of clamped records in one scratch buffer
 /// ([`HostList::batch_place`]).
-const BATCHES: u32 = 8;
+const BATCHES: u32 = 32;
+
+/// Pooled indirect-batch UAV buffer in `D3D12_RESOURCE_STATE_COMMON`, shared
+/// across all `HostList`s so idle lists never retain duplicate VRAM buffers.
+struct BatchBuf(ID3D12Resource);
+// SAFETY: D3D12 resources are free-threaded; buffers enter the pool only after
+// their owning list's last GPU submission has completed and transitioned them
+// back to COMMON.
+unsafe impl Send for BatchBuf {}
+
+static SPARE_BATCH: Mutex<Vec<BatchBuf>> = Mutex::new(Vec::new());
+const SPARE_BATCH_MAX: usize = 64;
+
+fn take_batch_buffer(size: u64) -> Option<ID3D12Resource> {
+    if let Some(BatchBuf(buf)) = SPARE_BATCH.lock().unwrap_or_else(|e| e.into_inner()).pop() {
+        return Some(buf);
+    }
+    let made = host()?.uav_buffer(size)?;
+    name(&made, || format!("indirect batches {size:#x}"));
+    Some(made)
+}
+
+fn give_batch_buffers(buffers: Vec<ID3D12Resource>) {
+    if buffers.is_empty() {
+        return;
+    }
+    let limit = if keep_freed() { SPARE_BATCH_MAX } else { 16 };
+    let mut overflow = Vec::new();
+    {
+        let mut spare = SPARE_BATCH.lock().unwrap_or_else(|e| e.into_inner());
+        for buf in buffers {
+            if spare.len() < limit {
+                spare.push(BatchBuf(buf));
+            } else {
+                overflow.push(buf);
+            }
+        }
+    }
+    drop(overflow);
+}
 
 /// A host command list and its allocator, always used together.
 pub(crate) struct HostList {
@@ -3945,6 +3984,7 @@ fn late_line(frames: f64) {
     crate::port_cbv::log(frames);
     crate::watch::port_guard_line(frames);
     crate::port_journal::line(frames);
+    crate::port_rt::line(frames);
     crate::picked::log(frames);
     #[cfg(feature = "diagnostics")]
     log_blame(frames);
@@ -3978,7 +4018,6 @@ pub(crate) mod awake;
 mod card_steps;
 #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
 pub(crate) mod indirects;
-#[cfg(feature = "diagnostics")]
 mod panel;
 mod place;
 pub(crate) mod rec;
@@ -3991,6 +4030,10 @@ mod torn;
 #[cfg(feature = "diagnostics")]
 mod traffic;
 pub(crate) mod upcheck;
+#[cfg(feature = "diagnostics")]
+pub(crate) mod rtstamps;
+#[cfg(test)]
+mod rtbench;
 #[cfg(feature = "diagnostics")]
 mod stamps;
 #[cfg(feature = "diagnostics")]
@@ -4143,12 +4186,18 @@ pub(crate) fn walls_trace() -> bool {
 /// without it, so the title read a buffer nobody wrote, as before read-backs
 /// were made (the exposure metering's two small float targets, every frame).
 fn read_backs(list: &HostList) {
+    use crate::land::{count, spent, stat};
+    let started = std::time::Instant::now();
     // Textures shaders wrote that the title reads on the CPU
     // ([`crate::texback`]).
     for back in &list.deferred().texture_backs {
         crate::texback::land(back);
+        count(stat::RB_TEXTURE_COUNT, 1);
     }
+    let textures_done = spent(stat::RB_TEXTURES, started);
     for (buffer, at, [row, rows, pitch]) in &list.deferred().backs {
+        count(stat::RB_BUFFER_COUNT, 1);
+        count(stat::RB_BUFFER_BYTES, (*row * *rows) as u64);
         let mut data = std::ptr::null_mut();
         // SAFETY: a read-back buffer of ours, written by the list that has
         // run; the title's destination holds every row (checked when the
@@ -4176,6 +4225,7 @@ fn read_backs(list: &HostList) {
             }
         }
     }
+    spent(stat::RB_BUFFERS, textures_done);
 }
 
 /// After the card ran what declared `back`: what shaders wrote there goes
@@ -5274,17 +5324,22 @@ impl Host {
         let mut telling = std::time::Instant::now();
         for item in items {
             telling = match item {
-                Late::Run(flight) => {
+                Late::Run(mut flight) => {
                     last = flight.number;
                     for &i in &flight.order {
                         read_backs(flight.lists[i].host());
                     }
+                    let done_from = std::time::Instant::now();
                     if let Some(card) = flight.card {
                         self.card_done(card);
                     }
                     if let Some(own) = flight.own {
                         own.landed();
                     }
+                    for detached in &mut flight.lists {
+                        detached.release_tables();
+                    }
+                    crate::land::spent(crate::land::stat::RB_DONE, done_from);
                     landed.push((flight.lists, flight.order));
                     crate::land::spent(crate::land::stat::READ_BACKS, telling)
                 }
@@ -5744,13 +5799,16 @@ impl Host {
             let mut landed = Vec::new();
             for item in items {
                 match item {
-                    Late::Run(flight) => {
+                    Late::Run(mut flight) => {
                         last = flight.number;
                         for &i in &flight.order {
                             read_backs(flight.lists[i].host());
                         }
                         if let Some(card) = flight.card {
                             self.card_done(card);
+                        }
+                        for detached in &mut flight.lists {
+                            detached.release_tables();
                         }
                         landed.push((flight.lists, flight.order));
                     }
@@ -6728,6 +6786,15 @@ impl HostList {
                 give_chunks(std::mem::take(&mut scratch.chunks));
             }
         }
+        {
+            let mut args = self.batch_args.lock().unwrap_or_else(|e| e.into_inner());
+            let left = std::mem::take(&mut args.1);
+            let buffers = std::mem::take(&mut args.0);
+            drop(args);
+            if left == 0 {
+                give_batch_buffers(buffers);
+            }
+        }
         // SAFETY: the list is not executing.
         let reset = unsafe {
             self.allocator
@@ -7079,7 +7146,7 @@ impl HostList {
             let key = std::sync::Arc::as_ptr(copy) as usize;
             // A texture cut from a block may lie where another did: what the card
             // holds of that one is done with before the first upload into this one.
-            if crate::pool::on() && *first_upload {
+            if crate::pool::on() && *first_upload && crate::pool::pooled(&copy.texture) {
                 aliasing.push(D3D12_RESOURCE_BARRIER {
                     Type: D3D12_RESOURCE_BARRIER_TYPE_ALIASING,
                     Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
@@ -7285,9 +7352,38 @@ impl HostList {
     /// Copies `len` bytes of title memory at `src` into the list's upload
     /// memory at `dst` when the list is submitted.
     pub(crate) fn defer_fill(&self, dst: *mut u8, src: *const u8, len: usize) {
+        let src = self.forward_fill(src as usize, len);
         self.deferred()
             .copies
-            .push(Step::Fill(dst as usize, src as usize, len, None));
+            .push(Step::Fill(dst as usize, src, len, None));
+    }
+
+    /// Renderer port RT: where a fill of `[src, src + len)` recorded now
+    /// takes its bytes. If the last step of this list that writes them is a
+    /// copy at its place ([`place`]) that holds all of them and copies what
+    /// the CPU takes out of its source at submission, and no step since
+    /// writes the source or declares a shader write over either, the fill
+    /// takes them out of that source: the same bytes the card has there when
+    /// the list reads them (`crate::port_rt`). Else `src`.
+    fn forward_fill(&self, src: usize, len: usize) -> usize {
+        if !crate::port_rt::on() || len == 0 {
+            return src;
+        }
+        let deferred = self.deferred();
+        let seen = deferred.copies.iter().rev().map(|step| match step {
+            Step::Placed(p) => crate::port_rt::Seen::Placed { dst: p.dst, src: p.src, len: p.len, from_upload: p.from_upload() },
+            &Step::Copy(d, _, n) => crate::port_rt::Seen::Writes(d, d + n),
+            &Step::GpuWrite(_, a, n) => crate::port_rt::Seen::Writes(a, a + n),
+            Step::Run(_) => crate::port_rt::Seen::Anything,
+            _ => crate::port_rt::Seen::Nothing,
+        });
+        match crate::port_rt::forwarded(seen, src, len) {
+            Some(from) => {
+                crate::port_rt::count(crate::port_rt::FORWARDED);
+                from
+            }
+            None => src,
+        }
     }
 
     /// The host address of `len` bytes of scratch memory that hold the title
@@ -7308,16 +7404,18 @@ impl HostList {
     /// As [`HostList::defer_fill`], for upload memory that only `slot` (a
     /// title heap's address, and the slot) shows.
     pub(crate) fn defer_constants(&self, dst: *mut u8, src: *const u8, len: usize, slot: (usize, u32)) {
+        let src = self.forward_fill(src as usize, len);
         self.deferred()
             .copies
-            .push(Step::Fill(dst as usize, src as usize, len, Some(card_steps::FillTo::Slot(slot.0, slot.1))));
+            .push(Step::Fill(dst as usize, src, len, Some(card_steps::FillTo::Slot(slot.0, slot.1))));
     }
 
     /// As [`HostList::defer_fill`], for the beginning of a buffer
     /// [`HostList::upload`] made.
     pub(crate) fn defer_fill_buffer(&self, buffer: &ID3D12Resource, dst: *mut u8, src: *const u8, len: usize) {
         let to = (card_steps::stage() > 1).then(|| card_steps::FillTo::Buffer(buffer.clone()));
-        self.deferred().copies.push(Step::Fill(dst as usize, src as usize, len, to));
+        let src = self.forward_fill(src as usize, len);
+        self.deferred().copies.push(Step::Fill(dst as usize, src, len, to));
     }
 
     /// Brings `[address, address + len)` of a buffer's host copy up to date
@@ -7607,8 +7705,7 @@ impl HostList {
         let (buffer, i) = ((args.1 / BATCHES) as usize, args.1 % BATCHES);
         if buffer == args.0.len() {
             let size = u64::from(BATCHES * JOBS * SLOT);
-            let made = host()?.uav_buffer_internal(size)?;
-            name(&made, || format!("indirect batches {size:#x}"));
+            let made = take_batch_buffer(size)?;
             args.0.push(made);
         }
         args.1 += 1;
@@ -9456,7 +9553,6 @@ struct Presenter {
     meter: Meter,
     /// Composes a second presented plane over the first ([`crate::compose`]).
     composer: Option<crate::compose::Composer>,
-    #[cfg(feature = "diagnostics")]
     panel: panel::Panel,
 }
 
@@ -9529,7 +9625,6 @@ impl Meter {
     }
 
     /// Whether the next frame counted makes the frame-rate line.
-    #[cfg(feature = "diagnostics")]
     fn line_due(&self) -> bool {
         self.since.elapsed() >= std::time::Duration::from_secs(1)
     }
@@ -10111,7 +10206,6 @@ impl Host {
             } else {
                 crate::popwatch::take(&self.device, list, texture)
             };
-            #[cfg(feature = "diagnostics")]
             p.panel.draw(self, copy, &back, (width, height), format);
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
@@ -10160,7 +10254,6 @@ impl Host {
             let mut showing = crate::timeline::span("the host's Present");
             let status = p.swap_chain.Present(0, DXGI_PRESENT(0));
             showing.next("the frame meter");
-            #[cfg(feature = "diagnostics")]
             if status == windows::Win32::Foundation::S_OK {
                 p.panel.frame(p.meter.line_due());
             }
@@ -10219,7 +10312,6 @@ impl Host {
                 hwnd,
                 meter: Meter::new(),
                 composer: None,
-                #[cfg(feature = "diagnostics")]
                 panel: panel::Panel::new(),
             })
         }
@@ -11689,10 +11781,10 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         use super::vram_keep;
         let gib = 1 << 30;
         assert_eq!(vram_keep(100 * gib, 87 * gib).0, 600_000);
-        // Past it: the longest idle ones, enough to come down to 85 %.
-        let (ms, bytes) = vram_keep(100 * gib, 90 * gib);
-        assert_eq!((ms, bytes), (5_000, 5 * gib));
-        assert_eq!(vram_keep(100 * gib, 120 * gib), (1_500, 35 * gib));
+        // Past it: the longest idle ones, enough to come down.
+        assert_eq!(vram_keep(100 * gib, 88 * gib), (5_000, 3 * gib));
+        assert_eq!(vram_keep(100 * gib, 95 * gib), (3_000, 10 * gib));
+        assert_eq!(vram_keep(100 * gib, 120 * gib), (3_000, 35 * gib));
         assert_eq!(vram_keep(0, 7).0, 5_000);
     }
 
