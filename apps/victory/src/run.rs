@@ -53,6 +53,31 @@ pub fn run(
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
     let cfg = victory_core::Config::load()?;
+    #[cfg(windows)]
+    if execute {
+        let asked = victory_hle::streamline::Asked::from_env().map_err(anyhow::Error::msg)?;
+        let available = victory_hle::streamline::init(&asked);
+        if available.dlss || available.framegen {
+            println!(
+                "streamline     DLSS {} ({}), frame generation {}",
+                if available.dlss { "on" } else { "off" },
+                asked.mode.name(),
+                if available.framegen { "on" } else { "off" },
+            );
+            if std::env::var_os("VICTORY_OWN_UPSCALER").is_none_or(|v| v == "1") {
+                // SAFETY: single-threaded launch setup before the image is mapped or threads spawn.
+                unsafe { std::env::set_var("VICTORY_OWN_UPSCALER", "0") };
+            }
+            if std::env::var_os("VICTORY_UPSCALER").is_none() {
+                // SAFETY: as above; selects the FidelityFX path (7) for Streamline interception.
+                unsafe { std::env::set_var("VICTORY_UPSCALER", "7") };
+            }
+            if available.dlss && std::env::var_os("VICTORY_FFX_SCALE").is_none() {
+                // SAFETY: as above; matches asked DLSS mode's internal scale.
+                unsafe { std::env::set_var("VICTORY_FFX_SCALE", format!("{:.6}", asked.mode.scale())) };
+            }
+        }
+    }
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
     let prepared = victory_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();
@@ -162,7 +187,8 @@ pub fn run(
         show(name, dll.bind_imports(&with_dlls, policy)?);
     }
     let exe_name = exe.file_name().unwrap_or_default().to_string_lossy();
-    show(&exe_name, image.bind_imports(&with_dlls, policy)?);
+    let interposed = victory_hle::modules::fidelityfx::Interpose { inner: &with_dlls };
+    show(&exe_name, image.bind_imports(&interposed, policy)?);
     if execute {
         let size = image.info().size_of_image as usize;
         // SAFETY: the image stays mapped, and nothing of it has run yet.

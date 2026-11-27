@@ -3079,6 +3079,10 @@ fn stage_spans(p: &HostPipeline) -> Few<(u8, u32, u32), 16> {
             crate::pipeline::note_drop(self.pipeline as This);
             return;
         }
+        if crate::pipeline::skips_rt_skin(self.pipeline as This) {
+            once!("passes that only serve rays are left out (VICTORY_RT_MISS=1, builder off; VICTORY_RT_SKIN, VICTORY_RT_RESOLVE, VICTORY_RT_TRACE, VICTORY_ACTIVATE_RAYS =1 run them)");
+            return;
+        }
         // The ray-tracing structure builder's stages run all or none.
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -4124,6 +4128,9 @@ fn stage_spans(p: &HostPipeline) -> Few<(u8, u32, u32), 16> {
         self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
+        if crate::streamline::hudless_wanted() {
+            self.before_shown_target(list, vertices == 3 && instances == 1);
+        }
         let ready = self.prepare(list, false);
         // A pipeline with the rectangle geometry stage draws the title's
         // vertices as they are; any other gets its rectangles expanded.
@@ -4151,6 +4158,29 @@ fn stage_spans(p: &HostPipeline) -> Few<(u8, u32, u32), 16> {
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
+    }
+
+    /// With frame generation (`crate::streamline`), before a draw into one
+    /// colour target without depth: if the target is one the title presents,
+    /// the draw is told there, where the colour without the interface is
+    /// copied in front of the title's interface composite. `triangle`: one
+    /// triangle, one instance (the composite's shape). Only copies and
+    /// barriers are recorded; the target is moved back to a render target by
+    /// the draw's own preparation.
+    fn before_shown_target(&self, list: &HostList, triangle: bool) {
+        if self.depth != 0 {
+            return;
+        }
+        let &[target] = self.targets.as_slice() else {
+            return;
+        };
+        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            return;
+        };
+        if p.compute || p.mesh {
+            return;
+        }
+        crate::streamline::before_target_draw(list, target as This, p, triangle);
     }
 
     /// Whether the bound pipeline completes rectangles itself, in the
@@ -4233,6 +4263,9 @@ fn stage_spans(p: &HostPipeline) -> Few<(u8, u32, u32), 16> {
         self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
+        if crate::streamline::hudless_wanted() {
+            self.before_shown_target(list, false);
+        }
         // Indexed rectangles are drawn by the rectangle geometry stage
         // alone (nothing expands them on the CPU).
         let lost = self.topology == RECTANGLES && !self.completes_rects();
@@ -4353,7 +4386,9 @@ impl State {
             crate::pipeline::note_drop(self.pipeline as This);
             return false;
         }
-        if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
+        if crate::pipeline::skips_rt_skin(self.pipeline as This)
+            || (crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs())
+        {
             return false;
         }
         const DRAW: u32 = 0;

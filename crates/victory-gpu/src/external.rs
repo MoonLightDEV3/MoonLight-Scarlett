@@ -56,6 +56,32 @@ pub fn finish_submitted() {
     crate::host::settle_for_fence();
 }
 
+/// Move a title texture to host resource `state` inside `list`, returning its
+/// host resource and legalized state (for `crate::streamline`).
+pub(crate) fn host_texture(
+    list: &crate::host::HostList,
+    resource: This,
+    state: u32,
+) -> Option<(ID3D12Resource, u32)> {
+    let texture = crate::resource::host_resource(resource)?.clone();
+    crate::list::ensure_state(list, resource, state);
+    let state = crate::host::legal_state(&texture, state);
+    Some((texture, state))
+}
+
+/// Prepare aliases, mip uploads, and depth twins for an external input texture
+/// (`crate::streamline`).
+pub(crate) fn prepare_input(list: &crate::host::HostList, resource: This) -> Option<()> {
+    let texture = crate::resource::host_resource(resource)?;
+    let aliased = crate::resource::alias_of(resource)
+        .is_some_and(|source| crate::texture::alias(list, resource, source));
+    if !aliased && crate::texture::title_written(texture) {
+        crate::texture::upload_from(list, resource, 0);
+    }
+    list.twin_use(resource, false, false);
+    Some(())
+}
+
 /// Runs `f` with the host list behind the title list `list` (open for
 /// recording); `None` without one. What `f` binds (descriptor heaps, root
 /// signatures, pipeline) is replaced before the list's next draw or

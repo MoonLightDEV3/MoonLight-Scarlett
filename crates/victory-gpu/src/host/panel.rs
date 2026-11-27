@@ -523,10 +523,16 @@ fn paint_hud(s: &Snapshot) -> Canvas {
     c.border(0, 0, BASE_W, BASE_H, BORDER);
 
     // 1. Large coloured FPS header.
-    let fps_str = format!("{:.0} FPS", s.fps.round());
-    c.text(14, 12, 4, fps_color(s.fps), &fps_str);
+    let shown = crate::streamline::shown_per_frame();
+    let shown_fps = s.fps * f64::from(shown);
+    let fps_str = format!("{:.0} FPS", shown_fps.round());
+    c.text(14, 12, 4, fps_color(shown_fps), &fps_str);
     // Subtle FPS decimal & ms badge on the right of the header.
-    let badge = format!("{:.1} FPS", s.fps);
+    let badge = if shown > 1 {
+        format!("{:.0}R FG{shown}X", s.fps)
+    } else {
+        format!("{:.1} FPS", s.fps)
+    };
     c.text(BASE_W - 14 - badge.len() as u32 * 12, 24, 2, MUTED, &badge);
 
     // 2. Resolution | draws | GPU ms.

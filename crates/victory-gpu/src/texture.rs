@@ -452,6 +452,19 @@ fn through_copy() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_COPY").is_some_and(|v| v == "1"))
 }
 
+/// Whether a texture refresh lets title memory move again as soon as its bytes
+/// are copied out (`VICTORY_TEXTURE_SHORT_HOLD=1`), and hashes and detiles the
+/// copy afterwards so streaming page remaps (`map_alias`) don't stall on CPU
+/// hashing and detiling.
+fn short_hold() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SHORT_HOLD").is_some_and(|v| v == "1"))
+}
+
+fn hold_no_more(mapped: &mut Option<crate::watch::Reading>) {
+    drop(mapped.take());
+}
+
 /// Calls `f` with the `size` bytes of title memory at `memory`, read
 /// through the kernel into this thread's read buffer; pages that are not
 /// there read as zeros. The bytes are those a read in place would see.
@@ -1305,7 +1318,7 @@ impl Staging {
         // stays mapped (see `crate::watch::title_memory_reading`; without
         // it a page went between the asking and the read in runs 71 and
         // 74).
-        let _mapped = if no_wait() {
+        let mut mapped = Some(if no_wait() {
             // Not waited for: while the runtime remaps title memory the
             // texture is read through the kernel instead, whole or not at
             // all (`no_wait`).
@@ -1315,7 +1328,8 @@ impl Staging {
             mapped
         } else {
             waited(2, crate::watch::title_memory_reading)
-        };
+        });
+        let short = short_hold();
         if !committed(self.memory, size) {
             // Partly mapped: a streamed texture with only some mips' pages
             // there, the usual state while it streams in. Read through the
@@ -1333,6 +1347,9 @@ impl Staging {
             crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
             let changed = with_read(size, |read| {
                 crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
+                if short {
+                    hold_no_more(&mut mapped);
+                }
                 let hash = digest(read);
                 if last.hash == Some(hash) {
                     return false;
@@ -1353,6 +1370,26 @@ impl Staging {
             }
             return size;
         }
+        if through_copy() && short {
+            return with_read(size, |tiled| {
+                crate::host::copy_mapped(tiled.as_mut_ptr(), self.memory, size, false);
+                hold_no_more(&mut mapped);
+                let tiled = &*tiled;
+                let hash = digest(tiled);
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
+                if last.hash == Some(hash) {
+                    return size;
+                }
+                last.hash = Some(hash);
+                found_blind(last);
+                self.detile(tiled);
+                self.keep_whole(tiled);
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
+                size
+            });
+        }
         if through_copy() {
             return with_title(self.memory, size, |tiled| {
                 let hash = digest(tiled);
@@ -1370,8 +1407,30 @@ impl Staging {
                 size
             });
         }
+        if short {
+            return with_read(size, |copy| {
+                // SAFETY: committed memory of the texture's layout size, and
+                // it stays committed while `mapped` is held until the copy completes.
+                unsafe { std::ptr::copy_nonoverlapping(self.memory, copy.as_mut_ptr(), size) };
+                hold_no_more(&mut mapped);
+                let copy = &*copy;
+                let hash = digest(copy);
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
+                if last.hash == Some(hash) {
+                    return size;
+                }
+                last.hash = Some(hash);
+                found_blind(last);
+                self.detile(copy);
+                self.keep_whole(copy);
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
+                size
+            });
+        }
         // SAFETY: committed memory of the texture's layout size, and it
-        // stays committed while `_mapped` is held.
+        // stays committed while `mapped` is held.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
         let hash = digest(tiled);
         #[cfg(feature = "diagnostics")]

@@ -390,6 +390,24 @@ pub extern "system" fn XMemIsToolsMemAvailable() -> BOOL {
 
 const PAGE: usize = 64 << 10;
 
+/// Split large physical allocations into pagefile-backed sections of up to this
+/// many MiB (`VICTORY_SECTION_MB`, default `2`; `0` keeps one section per call),
+/// avoiding contention on a single multi-GiB section lock during streaming remaps.
+fn section_pages() -> usize {
+    static PAGES: LazyLock<usize> = LazyLock::new(|| {
+        let mb = std::env::var("VICTORY_SECTION_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(2);
+        if mb == 0 {
+            usize::MAX
+        } else {
+            mb.saturating_mul((1 << 20) / PAGE).max(1)
+        }
+    });
+    *PAGES
+}
+
 struct Section {
     handle: HANDLE,
     pages: usize,
@@ -648,57 +666,72 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     }
     // SAFETY: checked non-null.
     let n = unsafe { *count };
-    let Some(size) = n.checked_mul(PAGE).filter(|&s| s > 0) else {
+    if n == 0 || n.checked_mul(PAGE).is_none() {
         return 0;
-    };
-    // A pagefile-backed section of `size` bytes, its pages committed when
-    // first mapped or written (`commit`): the title asks for 6.1
-    // GiB at once, which a busy host often cannot commit (error 1450).
-    // SAFETY: plain section creation.
-    let handle = unsafe {
-        CreateFileMappingW(
-            INVALID_HANDLE_VALUE,
-            std::ptr::null(),
-            // Under Wine a committed section is a sparse file, free until
-            // touched, and committing a reserved one page by page costs a
-            // wineserver request each that scans every range committed so
-            // far: commit it whole there.
-            PAGE_READWRITE | if on_wine() { SEC_COMMIT } else { SEC_RESERVE },
-            (size as u64 >> 32) as u32,
-            size as u32,
-            std::ptr::null(),
-        )
-    };
-    if handle.is_null() {
-        let error = std::io::Error::last_os_error();
-        tracing::warn!(n, %error, "XMemAllocatePhysicalPages failed");
+    }
+    let per = section_pages();
+    let wine = on_wine();
+    let mut sections = Vec::new();
+    if sections.try_reserve_exact(n.div_ceil(per)).is_err() {
         // SAFETY: checked non-null.
         unsafe { count.write(0) };
         return 0;
     }
+    for first in (0..n).step_by(per) {
+        let chunk = (n - first).min(per);
+        let size = chunk * PAGE;
+        // A pagefile-backed section of `size` bytes, its pages committed when
+        // first mapped or written (`commit`). Under Wine a committed section
+        // is a sparse file, free until touched.
+        // SAFETY: plain section creation.
+        let handle = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE | if wine { SEC_COMMIT } else { SEC_RESERVE },
+                (size as u64 >> 32) as u32,
+                size as u32,
+                std::ptr::null(),
+            )
+        };
+        if handle.is_null() {
+            let error = std::io::Error::last_os_error();
+            tracing::warn!(n, %error, "XMemAllocatePhysicalPages failed");
+            // Earlier handles close on drop. No page numbers published yet.
+            // SAFETY: checked non-null.
+            unsafe { count.write(0) };
+            return 0;
+        }
+        // For the GPU side's in-place census: only a committed section can be
+        // opened as a host heap.
+        victory_gpu::title_memory_section(handle as usize, size as u64, wine);
+        let section = Arc::new(Section {
+            handle,
+            pages: chunk,
+            window: std::sync::OnceLock::new(),
+            committed: (0..chunk.div_ceil(64))
+                .map(|_| std::sync::atomic::AtomicU64::new(0))
+                .collect(),
+        });
+        sections.push((first, chunk, section));
+    }
     tracing::debug!(
         n,
+        sections = sections.len(),
         flags = format_args!("{flags:#x}"),
         "XMemAllocatePhysicalPages"
     );
-    // For the GPU side's in-place census: only a committed section can be
-    // opened as a host heap.
-    victory_gpu::title_memory_section(handle as usize, size as u64, on_wine());
-    let section = Arc::new(Section {
-        handle,
-        pages: n,
-        window: std::sync::OnceLock::new(),
-        committed: (0..n.div_ceil(64)).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
-    });
     let mut table = page_table_mut();
     let first = table.next_page;
     table.next_page += n * FRAMES;
-    for index in 0..n {
-        let slice = Slice {
-            section: section.clone(),
-            index,
-        };
-        table.pages.insert(first + index * FRAMES, slice);
+    for (offset, chunk, section) in &sections {
+        for index in 0..*chunk {
+            let slice = Slice {
+                section: section.clone(),
+                index,
+            };
+            table.pages.insert(first + (offset + index) * FRAMES, slice);
+        }
     }
     // Title memory is touched without our locks: a fault there may wait for
     // a mapping call, which takes them.
@@ -2686,5 +2719,16 @@ mod tests {
         assert!(page_window(&[a[0], b[0]], 0, PAGE).is_some());
         assert_eq!(XMemFreePhysicalPages(3, a.as_ptr()), 1);
         assert_eq!(XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+
+    #[test]
+    fn physical_page_numbers_continue_and_bridge_2mib_sections() {
+        let pages = allocate(35);
+        assert!(pages.windows(2).all(|pair| pair[1] == pair[0] + FRAMES));
+        // Last byte of the first 2 MiB section (page 31) and first byte of the second (page 32).
+        assert!(write_physical(&pages, 32 * PAGE - 1, &[17, 29]));
+        assert_eq!(page_bytes(pages[31])[PAGE - 1], 17);
+        assert_eq!(page_bytes(pages[32])[0], 29);
+        assert_eq!(XMemFreePhysicalPages(pages.len(), pages.as_ptr()), 1);
     }
 }

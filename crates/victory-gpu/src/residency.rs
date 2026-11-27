@@ -121,12 +121,30 @@ pub(crate) fn limited_host_ram() -> bool {
     })
 }
 
-fn next_pressure(was: bool, physical: u64, commit: u64) -> bool {
-    if was {
+/// True on 16 GB Windows systems (`<= 18 GiB` physical RAM), where tighter
+/// pressure thresholds keep pagefile commit headroom ahead of heavy streaming.
+pub(crate) fn tight_host_ram() -> bool {
+    static TIGHT: OnceLock<bool> = OnceLock::new();
+    *TIGHT.get_or_init(|| on() && memory_status().is_some_and(|s| s.ullTotalPhys <= 18 * GIB))
+}
+
+fn next_pressure_for(was: bool, physical: u64, commit: u64, tight: bool) -> bool {
+    if tight {
+        if was {
+            physical < 2048 * MIB || commit < 3072 * MIB
+        } else {
+            physical <= 1280 * MIB || commit <= 2048 * MIB
+        }
+    } else if was {
         physical < 5 * GIB || commit < 6 * GIB
     } else {
         physical <= 3 * GIB || commit <= 4 * GIB
     }
+}
+
+#[cfg(test)]
+fn next_pressure(was: bool, physical: u64, commit: u64) -> bool {
+    next_pressure_for(was, physical, commit, false)
 }
 
 /// Called by the once-per-second submission sweep. A failed sample keeps the last good state.
@@ -138,7 +156,7 @@ pub(crate) fn refresh() {
     let (physical, commit) = (status.ullAvailPhys, status.ullAvailPageFile);
     HEADROOM.store(physical.min(commit), Ordering::Relaxed);
     let was = pressured();
-    let pressure = next_pressure(was, physical, commit);
+    let pressure = next_pressure_for(was, physical, commit, tight_host_ram());
     if pressure != was {
         PRESSURED.store(pressure, Ordering::Relaxed);
         if pressure {

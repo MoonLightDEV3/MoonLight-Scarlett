@@ -160,6 +160,19 @@ pub(crate) fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut
     crate::copystat::recorded(started);
 }
 
+/// Runs `f` with the host list behind `this` for an external recorder
+/// (`crate::streamline`) and marks the external compute state dirty.
+#[cfg(windows)]
+pub(crate) fn external<R>(this: This, f: impl FnOnce(&crate::host::HostList) -> R) -> Option<R> {
+    let list = thin::for_external(this)?;
+    let mut out = None;
+    with_state(list, |host, state| {
+        out = Some(f(host));
+        state.external_compute();
+    });
+    out
+}
+
 /// The submission of `lists` has run: each gives its descriptor tables'
 /// slots back ([`crate::draw::State::tables_done`]). A list cut at waits
 /// keeps them: its state goes with its last part.

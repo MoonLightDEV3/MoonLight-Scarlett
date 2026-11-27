@@ -1598,7 +1598,9 @@ fn wide(jobs: Vec<Job>) {
             let left = left.clone();
             workers.there.fetch_add(1, Ordering::AcqRel);
             queue.push_back(Box::new(move || {
-                job();
+                // A `wide` job that calls `wide` again would wait on the
+                // threads it is one of; mark it for `in_wide_job`.
+                in_wide(job);
                 let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
                 *n -= 1;
                 if *n == 0 {
@@ -1613,7 +1615,7 @@ fn wide(jobs: Vec<Job>) {
         match job {
             Some(job) => {
                 workers.there.fetch_sub(1, Ordering::AcqRel);
-                job()
+                in_wide(job);
             }
             None => break,
         }
@@ -1629,6 +1631,33 @@ fn wide(jobs: Vec<Job>) {
 /// refreshes, the merge of what shaders wrote to card copies).
 pub(crate) fn wide_run(jobs: Vec<Box<dyn FnOnce() + Send>>) {
     wide(jobs);
+}
+
+/// Whether [`wide`] has threads to give work to besides the calling one.
+pub(crate) fn wide_available() -> bool {
+    wide_threads() > 1
+}
+
+/// Whether this thread is running a job of [`wide`] now (avoids nesting
+/// [`read_wide`] back onto the pool it is already inside of).
+pub(crate) fn in_wide_job() -> bool {
+    IN_WIDE.with(|n| n.get() > 0)
+}
+
+thread_local! {
+    static IN_WIDE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+fn in_wide(job: Box<dyn FnOnce() + Send>) {
+    struct Unmark;
+    impl Drop for Unmark {
+        fn drop(&mut self) {
+            IN_WIDE.with(|n| n.set(n.get().saturating_sub(1)));
+        }
+    }
+    IN_WIDE.with(|n| n.set(n.get() + 1));
+    let _unmark = Unmark;
+    job();
 }
 
 /// Calls `work` with every number under `n`, on the kept threads and on
@@ -3631,7 +3660,9 @@ impl Shadow {
                 return to;
             }
             let at = from + (to - from) / threads * i;
-            (at - (start + at) % PIECE).max(from)
+            // (saturating: near the copy's start, the piece `at` lies in may
+            // begin before the copy does)
+            at.saturating_sub((start + at) % PIECE).max(from)
         };
         let scan = &scan;
         std::thread::scope(|s| {

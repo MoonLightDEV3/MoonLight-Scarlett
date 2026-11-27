@@ -741,12 +741,18 @@ fn workers() -> bool {
     })
 }
 
+/// Stack reserved for each pipeline worker thread: NVIDIA's DXIL driver
+/// compiler overflows the default Windows 1 MiB stack on large world compute
+/// shaders.
+const PIPELINE_STACK: usize = 64 << 20;
+
 /// Starts one worker: one for passes over the screen alone, or one of the
 /// others.
 fn spawn_worker(screens_only: bool) -> bool {
     let slot = NEXT_SLOT.fetch_add(1, Ordering::Relaxed);
     let spawned = std::thread::Builder::new()
         .name(format!("victory-pipelines-{slot}"))
+        .stack_size(PIPELINE_STACK)
         .spawn(move || {
             WORKER_SLOT.set(slot);
             // Below the title's own threads (loading, recording),

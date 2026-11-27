@@ -171,6 +171,19 @@ enum Command {
     /// docs/replay.md).
     #[cfg(all(windows, feature = "diagnostics"))]
     Replay(replay::Replay),
+    /// Check NVIDIA Streamline (DLSS SR + Frame Generation) readiness.
+    #[cfg(windows)]
+    UpscalerCheck {
+        /// Output resolution WxH.
+        #[arg(long, default_value = "1920x1080")]
+        output: String,
+        /// Create a host D3D12 device + proxied queue and evaluate DLSS.
+        #[arg(long)]
+        device: bool,
+        /// Also open a window and run a proxied DXGI Present with DLSS-G.
+        #[arg(long)]
+        present: bool,
+    },
     /// Show the resolved configuration and check it.
     Config,
 }
@@ -253,6 +266,25 @@ fn main() -> Result<()> {
         }
         #[cfg(all(windows, feature = "diagnostics"))]
         Command::Replay(options) => replay::run(options),
+        #[cfg(windows)]
+        Command::UpscalerCheck {
+            output,
+            device,
+            present,
+        } => {
+            let size = output
+                .split_once(['x', 'X'])
+                .and_then(|(w, h)| {
+                    Some([w.trim().parse::<u32>().ok()?, h.trim().parse::<u32>().ok()?])
+                })
+                .ok_or_else(|| {
+                    anyhow::anyhow!("invalid --output {output:?} (expected WxH, e.g. 1920x1080)")
+                })?;
+            for line in victory_hle::streamline::check(size, device || present, present) {
+                println!("{line}");
+            }
+            Ok(())
+        }
         Command::Config => show_config(),
     }
 }
@@ -317,6 +349,7 @@ fn apply_runtime_defaults() {
     set_default("VICTORY_EARLY_TABLES", "1");
     set_default("VICTORY_NAN_SCRUB", "1");
     set_default("VICTORY_PIPELINE_WAIT_ONCE", "1");
+    set_default("VICTORY_PORT_CONSTANTS", "1");
     set_default("VICTORY_PORT_CONSTANTS_ORDER", "1");
     set_default("VICTORY_FAIR_DUE", "1");
     // Visuals, lighting & non-black textures/skin: directional SH GI + keep-shown fallback.
@@ -328,6 +361,7 @@ fn apply_runtime_defaults() {
     set_default("VICTORY_KEEP_SHOWN", "1");
     set_default("VICTORY_SHOW_AFTER", "1");
     set_default("VICTORY_SKIP_PIPELINES", "none");
+    set_default("VICTORY_LEAVE_OUT", "02384a60fda6f2d0");
     set_default("VICTORY_RAYMARCHED_LOCAL_LIGHTS", "0");
     set_default("VICTORY_OWN_UPSCALER", "1");
     set_default("VICTORY_BVH_MISS", "1");
@@ -335,10 +369,16 @@ fn apply_runtime_defaults() {
     // Disable Wave32 LDS flag-region pass (PR #4) on NVIDIA: compiling 2cc4c197ee29e291
     // without full Wave64 LDS sync blacks out opaque lighting tiles on cinderblock walls.
     set_default("VICTORY_LDS_FLAGS", "0");
-    // 1080p@0.50 internal scale (960x540 -> 1080p TAAU) + unlocked frame interval for RTX 5060 8 GB laptop.
+    // 1080p + unlocked 1 ms frame clock + NVIDIA Streamline DLSS Quality & DLSS-G 3x on RTX 5060.
+    // run.rs automatically switches VICTORY_OWN_UPSCALER=0 / VICTORY_UPSCALER=7 when Streamline loads,
+    // keeping 960x540 TAAU as an automatic fallback if NVIDIA DLLs are absent.
+    set_default("VICTORY_DLSS", "1");
+    set_default("VICTORY_DLSS_MODE", "quality");
+    set_default("VICTORY_FRAMEGEN", "1");
+    set_default("VICTORY_FRAMEGEN_X", "3");
     set_default("VICTORY_OUTPUT", "1920x1080");
     set_default("VICTORY_RENDER_SCALE", "0.50");
-    set_default("VICTORY_FRAME_INTERVAL_MS", "16.667");
+    set_default("VICTORY_FRAME_INTERVAL_MS", "1");
     // Keep <= 262144 on NVIDIA 1M-capped view heaps to preserve bindless slots 500k..737k;
     // VICTORY_EARLY_TABLES=1 keeps 0 table allocation failures.
     set_default("VICTORY_DYNAMIC_SLOTS", "262144");
@@ -360,8 +400,10 @@ fn apply_runtime_defaults() {
     set_default("VICTORY_TEXTURE_BUDGET_MB", "1024");
     // Keep 4 KiB sub-64 KiB texture packing to avoid 3.3x VRAM bloat on 8 GB GPUs.
     set_default("VICTORY_POOL_SMALL", "1");
-    set_default("VICTORY_TEXTURE_ROOM_PERCENT", "88");
-    set_default("VICTORY_TEXTURE_STAGE_MB", "32");
+    set_default("VICTORY_TEXTURE_ROOM_PERCENT", "80");
+    set_default("VICTORY_TEXTURE_SHORT_HOLD", "1");
+    set_default("VICTORY_TEXTURE_STAGE_MB", "96");
+    set_default("VICTORY_TEXTURE_LOOK_MS", "400");
     set_default("VICTORY_TEXTURE_KEEP", "0");
     set_default("VICTORY_INPLACE", "0");
     set_default("VICTORY_SHADER_LOOP_LIMIT", "4096");

@@ -1054,12 +1054,15 @@ fn create() -> windows::core::Result<Host> {
             let amd = crate::indirect::amd(&device);
             victory_shader::emit::set_host_rdna(amd && o1.WaveLaneCountMin == 32 && o1.WaveLaneCountMax == 64);
         }
+        let proxied_queue = crate::streamline::device_made(&device);
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
-        let queue: ID3D12CommandQueue = device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
-            Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
-            ..Default::default()
+        let queue: ID3D12CommandQueue = proxied_queue.map(Ok).unwrap_or_else(|| {
+            device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                ..Default::default()
+            })
         })?;
         let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
         let event = CreateEventW(None, false, false, None)?;
@@ -1428,6 +1431,12 @@ pub(crate) struct HostList {
     /// depends on ([`HostList::changed_something`]); no two lists have the
     /// same.
     epoch: std::sync::atomic::AtomicU64,
+    /// The upscaling (`crate::streamline`) recorded in the list, noted for
+    /// the present after its submission; 0 for none.
+    upscale: std::sync::atomic::AtomicU64,
+    /// The copy of the colour without the interface (`crate::streamline`)
+    /// recorded in the list, noted likewise; 0 for none.
+    hudless: std::sync::atomic::AtomicU64,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// The texts of the markers `note_op` set, in order (for device-removed
@@ -2192,6 +2201,8 @@ fn shared_spare_limit(scratch_on: bool, critical: bool, pressured: bool, limited
         0
     } else if pressured {
         16 << 20
+    } else if crate::residency::tight_host_ram() {
+        32 << 20
     } else if limited_ram {
         48 << 20
     } else {
@@ -2395,6 +2406,13 @@ void main(uint3 id : SV_GroupID, uint thread : SV_GroupIndex) {
 #[cfg(test)]
 pub(crate) fn piece_hash(bytes: &[u8]) -> u32 {
     torn::hash(bytes)
+}
+
+/// Whether the compares of contiguous ranges of one card copy go in one pass
+/// (`VICTORY_CARD_COMPARE_JOIN=0`: a pass each).
+fn compare_join() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_COMPARE_JOIN").is_none_or(|v| v != "0"))
 }
 
 /// One pass of [`CARD_COMPARE`] over a span's pieces, into `differs` from
@@ -4457,6 +4475,8 @@ impl Host {
                 has_placed: std::sync::atomic::AtomicBool::new(false),
                 placed_cb_pool: Mutex::default(),
                 epoch: std::sync::atomic::AtomicU64::new(next_epoch()),
+                upscale: std::sync::atomic::AtomicU64::new(0),
+                hudless: std::sync::atomic::AtomicU64::new(0),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
                 notes,
@@ -4870,17 +4890,42 @@ impl Host {
                     list.SetComputeRootSignature(&work.root);
                     list.SetPipelineState(&work.pso);
                     list.SetComputeRootUnorderedAccessView(3, work.differs_gpu.GetGPUVirtualAddress());
+                    let join = compare_join();
+                    let mut pending: Option<(u64, u64, u32, crate::shadow::CardSpan, u32, u32)> = None;
+                    let flush = |p: Option<(u64, u64, u32, crate::shadow::CardSpan, u32, u32)>| {
+                        if let Some((buffer, before, size, span, at, mode)) = p {
+                            list.SetComputeRootShaderResourceView(1, buffer);
+                            list.SetComputeRootUnorderedAccessView(2, before);
+                            card_pass(list, &span, size, at, mode);
+                            CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
+                        }
+                    };
                     for r in plan.ranges.iter().filter(|r| r.compared) {
                         let (Some((_, Some(before), _)), size) = (r.shadow.card_sides(), r.shadow.card_hash_size()) else {
                             continue;
                         };
-                        list.SetComputeRootShaderResourceView(1, r.shadow.buffer.GetGPUVirtualAddress());
-                        list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
+                        let (buffer, before_at) = (r.shadow.buffer.GetGPUVirtualAddress(), before.GetGPUVirtualAddress());
                         // (What is only looked at keeps its hashes: what
                         // changed there is the next declared range's to land.)
-                        card_pass(list, &r.span, size as u32, r.at, if flown && !r.picked { 2 } else { 1 });
-                        CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
+                        let mode = if flown && !r.picked { 2 } else { 1 };
+                        if join
+                            && let Some((b, h, s, span, at, m)) = pending.as_mut()
+                            && *b == buffer
+                            && *h == before_at
+                            && *s == size as u32
+                            && *m == mode
+                            && span.skew == r.span.skew
+                            && span.first + span.pieces == r.span.first
+                            && *at + span.pieces == r.at
+                        {
+                            span.pieces += r.span.pieces;
+                            span.to = r.span.to;
+                            continue;
+                        }
+                        flush(pending.take());
+                        pending = Some((buffer, before_at, size as u32, r.span, r.at, mode));
                     }
+                    flush(pending.take());
                     list.ResourceBarrier(&[transition(
                         &work.differs_gpu,
                         D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
@@ -6135,6 +6180,16 @@ impl Host {
         }
         #[cfg(feature = "diagnostics")]
         let sending = crate::timeline::ticks();
+        for run in runs {
+            let id = run.take_upscale();
+            if id != 0 {
+                crate::streamline::submitted(id);
+            }
+            let id = run.take_hudless();
+            if id != 0 {
+                crate::streamline::hudless_submitted(id);
+            }
+        }
         if late {
             *submitted += 1;
             #[cfg(feature = "diagnostics")]
@@ -6766,6 +6821,8 @@ impl HostList {
         let started = std::time::Instant::now();
         let _resetting = crate::timeline::span("resetting a host list");
         self._alive.used();
+        self.upscale.store(0, Ordering::Relaxed);
+        self.hudless.store(0, Ordering::Relaxed);
         self.has_placed.store(false, Ordering::Release);
         self.placed_cb_pool.lock().unwrap_or_else(|e| e.into_inner()).1 = 0;
         *self.coming.lock().unwrap_or_else(|e| e.into_inner()) = None;
@@ -6818,6 +6875,32 @@ impl HostList {
     /// See [`HostList::changed_something`].
     pub(crate) fn epoch(&self) -> u64 {
         self.epoch.load(Ordering::Relaxed)
+    }
+
+    /// The list recorded upscaling `id` (`crate::streamline`).
+    pub(crate) fn mark_upscale(&self, id: u64) {
+        self.upscale.store(id, Ordering::Relaxed);
+    }
+
+    /// As `mark_upscale`, taken.
+    pub(crate) fn take_upscale(&self) -> u64 {
+        self.upscale.swap(0, Ordering::Relaxed)
+    }
+
+    /// The list recorded copy `id` of the colour without the interface
+    /// (`crate::streamline`, frame generation).
+    pub(crate) fn mark_hudless(&self, id: u64) {
+        self.hudless.store(id, Ordering::Relaxed);
+    }
+
+    /// The copy the list recorded (0 for none).
+    pub(crate) fn hudless(&self) -> u64 {
+        self.hudless.load(Ordering::Relaxed)
+    }
+
+    /// As [`HostList::hudless`], taken.
+    pub(crate) fn take_hudless(&self) -> u64 {
+        self.hudless.swap(0, Ordering::Relaxed)
     }
 
     /// Moves a title texture's host copy to `wanted` (a host state) in this
@@ -9177,8 +9260,20 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     let moved = std::time::Instant::now();
     let since = crate::watch::changes();
     // (A title destination that is away only while the runtime changes a
-    // mapping beside it is written when that is done.)
-    let whole = read(src, dst, len) || title_dst && crate::watch::again_after_change(since, || read(src, dst, len));
+    // mapping beside it is written when that is done. A long read from
+    // title memory into host memory uses several threads via `read_wide`.)
+    let wide = !title_dst
+        && len >= WIDE_READ_MIN
+        && crate::shadow::wide_available()
+        && !crate::shadow::in_wide_job();
+    let do_read = || {
+        if wide {
+            read_wide(src, dst, len)
+        } else {
+            read(src, dst, len)
+        }
+    };
+    let whole = do_read() || title_dst && crate::watch::again_after_change(since, || read(src, dst, len));
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
     if whole {
@@ -9269,6 +9364,35 @@ fn zero(to: *mut u8, n: usize) {
     }
     // SAFETY: inside the destination, which is mapped.
     unsafe { to.write_bytes(0, n) };
+}
+
+/// A copy this many bytes or longer is read by several threads at once
+/// ([`read`], [`read_wide`]). Below 4 MiB the hand-over costs what it saves.
+const WIDE_READ_MIN: usize = 4 << 20;
+
+/// One piece of a [`read_wide`] copy.
+const WIDE_READ_CHUNK: usize = 2 << 20;
+
+/// [`read`] of a long range split across worker threads. False if any piece was
+/// not readable so the caller falls back cleanly.
+fn read_wide(src: *const u8, dst: *mut u8, len: usize) -> bool {
+    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+    let (src, dst) = (src as usize, dst as usize);
+    let whole = std::sync::Arc::new(AtomicBool::new(true));
+    let mut jobs: Vec<Box<dyn FnOnce() + Send>> = Vec::with_capacity(len.div_ceil(WIDE_READ_CHUNK));
+    for at in (0..len).step_by(WIDE_READ_CHUNK) {
+        let n = WIDE_READ_CHUNK.min(len - at);
+        let whole = whole.clone();
+        jobs.push(Box::new(move || {
+            // SAFETY: disjoint slice within caller's verified range.
+            let (src, dst) = unsafe { ((src as *const u8).add(at), (dst as *mut u8).add(at)) };
+            if !read(src, dst, n) {
+                whole.store(false, Relaxed);
+            }
+        }));
+    }
+    crate::shadow::wide_run(jobs);
+    whole.load(Relaxed)
 }
 
 /// Reads title memory at `src` into `dst`; false if a page of it is not
@@ -9527,7 +9651,7 @@ impl Host {
 
 /// The swap chain formats a presented texture can be copied into: its own
 /// family's.
-fn swap_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
+pub(crate) fn swap_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
     Some(match format.0 {
         27..=32 => DXGI_FORMAT_R8G8B8A8_UNORM,
         87 | 90 | 91 => DXGI_FORMAT_B8G8R8A8_UNORM,
@@ -9703,6 +9827,7 @@ impl Meter {
             crate::queue::behind_line(frames);
             card_clock_line(frames, ms);
             upq::line(frames);
+            crate::streamline::line(frames);
             rec::line(frames);
             #[cfg(feature = "diagnostics")]
             spans::line(frames);
@@ -9922,7 +10047,15 @@ impl Meter {
             self.caption = Some(buffer);
         }
         let Some(caption) = &self.caption else { return };
-        let text = format!(" | VIctory {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
+        let shown = crate::streamline::shown_per_frame();
+        let text = if shown > 1 {
+            let fg_fps = fps * f64::from(shown);
+            format!(
+                " | VIctory {fg_fps:.0} fps (FG {shown}x, real {fps:.0} fps) {ms:.1} ms/frame {draws:.0} draws/frame"
+            )
+        } else {
+            format!(" | VIctory {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame")
+        };
         let mut text: Vec<u16> = caption.iter().copied().chain(text.encode_utf16()).collect();
         text.push(0);
         // Setting the text waits for the window's thread (a title thread,
@@ -10032,6 +10165,7 @@ impl Host {
             }
         }
         if (p.width, p.height, p.format) != (width, height, format) {
+            crate::streamline::resizing();
             // Presents sent ahead hold back buffers until they have run.
             settle_now(WHY_SYNC);
             // SAFETY: no back buffer is held; every submission was waited for.
@@ -10252,7 +10386,18 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             crate::replay::record::present(texture, state);
             let mut showing = crate::timeline::span("the host's Present");
+            let presenting = crate::streamline::present_begins(
+                frame,
+                crate::streamline::Planes {
+                    base: (texture, state_u32),
+                    overlay: planes.map(|(over, over_state, _, _)| (over, over_state.0 as u32)),
+                    size: [width, height],
+                },
+            );
+            let called = crate::streamline::present_called(&presenting);
             let status = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            crate::streamline::present_returned(called);
+            crate::streamline::present_ends(presenting);
             showing.next("the frame meter");
             if status == windows::Win32::Foundation::S_OK {
                 p.panel.frame(p.meter.line_due());
@@ -10265,6 +10410,14 @@ impl Host {
             #[cfg(not(feature = "diagnostics"))]
             Some(false)
         }
+    }
+
+    /// Lets the swap chain and what presents with it go, once everything
+    /// sent has run (`victory upscaler-check`: before Streamline is shut
+    /// down; nothing presents afterwards).
+    pub(crate) fn drop_presenter(&self) {
+        settle_now(WHY_SYNC);
+        *self.presenter.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     fn presenter(
@@ -10294,9 +10447,31 @@ impl Host {
                 SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
                 ..Default::default()
             };
-            let swap_chain = factory
-                .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?
-                .cast::<IDXGISwapChain3>()?;
+            let proxied = crate::streamline::swap_chain_factory(&factory).map(|(factory, queue)| {
+                factory
+                    .CreateSwapChainForHwnd(&queue, hwnd, &desc, None, None)
+                    .and_then(|s| s.cast::<IDXGISwapChain3>())
+            });
+            let swap_chain = match proxied {
+                Some(Ok(swap_chain)) => {
+                    crate::streamline::swap_chain_made(true, None);
+                    if let Ok(parent) = swap_chain.GetParent::<IDXGIFactory1>() {
+                        let _ = parent.MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER);
+                    }
+                    swap_chain
+                }
+                Some(Err(e)) => {
+                    crate::streamline::swap_chain_made(false, Some(&e));
+                    factory
+                        .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?
+                        .cast::<IDXGISwapChain3>()?
+                }
+                None => crate::streamline::present_hooked(
+                    factory
+                        .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?
+                        .cast::<IDXGISwapChain3>()?,
+                ),
+            };
             let _ = factory.MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER);
             let copy = self.new_list()?;
             copy.close();

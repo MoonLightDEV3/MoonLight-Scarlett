@@ -288,6 +288,95 @@ static BUILDER: Mutex<Builder> = Mutex::new(Builder {
     rests: 0,
 });
 
+/// What a compute pipeline does only for ray tracing ([`for_rays`]).
+#[cfg(windows)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RayOnly {
+    No,
+    Skin,
+    Resolve,
+    Activate,
+    Trace,
+}
+
+/// Identifies compute passes that only feed ray-tracing structures or
+/// trace/shade rays against them, so when `VICTORY_RT_MISS=1` and the BVH
+/// builder is off their direct and indirect dispatches can be skipped cleanly.
+/// (`CS_ScreenProbes_TraceRays_Voxels`/`Fallback` and `CS_RaytraceVBuffer_Voxels*`
+/// still run.)
+#[cfg(windows)]
+fn for_rays(bytes: &[u8]) -> RayOnly {
+    let has = |name: &[u8]| bytes.windows(name.len()).any(|w| w == name);
+    if has(b"CSComputeSkinning") || has(b"CSGenerateHairVB") {
+        RayOnly::Skin
+    } else if has(b"CS_RaytracingResolve") {
+        RayOnly::Resolve
+    } else if has(b"CS_ScreenProbes_ActivateRays") {
+        RayOnly::Activate
+    } else if (has(b"CS_ScreenProbes_TraceRays") && has(b"_BVH"))
+        || (has(b"CS_RaytraceVBuffer") && !has(b"Voxels"))
+    {
+        RayOnly::Trace
+    } else {
+        RayOnly::No
+    }
+}
+
+#[cfg(windows)]
+fn shaders_for_rays(shaders: &[Arc<Shader>]) -> RayOnly {
+    let [shader] = shaders else {
+        return RayOnly::No;
+    };
+    if shader.stage != "compute" {
+        return RayOnly::No;
+    }
+    for_rays(&shader.container)
+}
+
+#[cfg(all(test, windows))]
+#[test]
+fn ray_programs_are_known_by_name() {
+    assert_eq!(for_rays(b"..\0CSComputeSkinningRigidVelocity_1c34db0a_Wrapped\0.."), RayOnly::Skin);
+    assert_eq!(for_rays(b"..\0CS_PedStandardSkinning_3_00aa11bb_Wrapped\0.."), RayOnly::No);
+    assert_eq!(for_rays(b"computeclothSkinning"), RayOnly::No);
+    assert_eq!(for_rays(b"..\0CS_RaytracingResolve_Opaque_12345678_Wrapped\0.."), RayOnly::Resolve);
+    assert_eq!(for_rays(b"..\0CS_ScreenProbes_ActivateRays_0_Wrapped\0.."), RayOnly::Activate);
+    assert_eq!(for_rays(b"..\0CSGenerateHairVB_c88a8f19_Wrapped\0.."), RayOnly::Skin);
+    assert_eq!(for_rays(b"..\0CS_ScreenProbes_TraceRays_RayBinning_BVH_Mixed\0.."), RayOnly::Trace);
+    assert_eq!(for_rays(b"..\0CS_ScreenProbes_TraceRays_Voxels\0.."), RayOnly::No);
+    assert_eq!(for_rays(b"..\0CS_ScreenProbes_TraceRays_Fallback\0.."), RayOnly::No);
+    assert_eq!(for_rays(b"..\0CS_RaytraceVBuffer_ShaderBinning_WithFar\0.."), RayOnly::Trace);
+    assert_eq!(for_rays(b"..\0CS_RaytraceVBuffer_Voxels_RayBinning\0.."), RayOnly::No);
+}
+
+/// Whether a dispatch of `this` is left out because it only serves rays while
+/// `VICTORY_RT_MISS=1` and the BVH builder is off. Override flags
+/// `VICTORY_RT_SKIN=1`, `VICTORY_RT_RESOLVE=1`, `VICTORY_ACTIVATE_RAYS=1`,
+/// `VICTORY_RT_TRACE=1` re-enable individual groups.
+#[cfg(windows)]
+pub(crate) fn skips_rt_skin(this: This) -> bool {
+    fn off(switch: &str) -> bool {
+        (std::env::var_os("VICTORY_BVH_MISS").is_some_and(|v| v == "1")
+            || std::env::var_os("VICTORY_RT_MISS").is_some_and(|v| v == "1"))
+            && std::env::var_os("VICTORY_BVH_BUILDER").is_none_or(|v| v != "1")
+            && std::env::var_os(switch).is_none_or(|v| v != "1")
+    }
+    static SKIN: OnceLock<bool> = OnceLock::new();
+    static RESOLVE: OnceLock<bool> = OnceLock::new();
+    static ACTIVATE: OnceLock<bool> = OnceLock::new();
+    static TRACE: OnceLock<bool> = OnceLock::new();
+    if this.is_null() {
+        return false;
+    }
+    match pipeline(this).ray_only {
+        RayOnly::No => false,
+        RayOnly::Skin => *SKIN.get_or_init(|| off("VICTORY_RT_SKIN")),
+        RayOnly::Resolve => *RESOLVE.get_or_init(|| off("VICTORY_RT_RESOLVE")),
+        RayOnly::Activate => *ACTIVATE.get_or_init(|| off("VICTORY_ACTIVATE_RAYS")),
+        RayOnly::Trace => *TRACE.get_or_init(|| off("VICTORY_RT_TRACE")),
+    }
+}
+
 /// Whether `shaders` are a pipeline of the structure builder.
 #[cfg(windows)]
 fn of_builder(shaders: &[Arc<Shader>]) -> bool {
@@ -432,6 +521,9 @@ struct Pipeline {
     /// One of the ray-tracing structure builder's ([`Builder`]).
     #[cfg(windows)]
     builder: bool,
+    /// Compute shader category that only feeds/walks ray-tracing structures.
+    #[cfg(windows)]
+    ray_only: RayOnly,
     /// Precomputed skip status from `VICTORY_SKIP_PIPELINES` / `VICTORY_SKIP_RT=1`.
     #[cfg(windows)]
     skipped: bool,
@@ -574,6 +666,36 @@ fn skip_raymarched_local_lights(shaders: &[Arc<Shader>]) -> bool {
         .any(|s| s.container.windows(NEEDLE.len()).any(|w| w == NEEDLE))
 }
 
+/// Shader hashes whose pipelines are left out in every build
+/// (`VICTORY_LEAVE_OUT=<16 hex digits>[,..]`), e.g. `02384a60fda6f2d0`
+/// (`CS_DefragHeap_ComputeRelocations`).
+#[cfg(windows)]
+fn leave_out_match(shaders: &[Arc<Shader>]) -> bool {
+    static HASHES: OnceLock<Vec<String>> = OnceLock::new();
+    let list = HASHES.get_or_init(|| {
+        std::env::var("VICTORY_LEAVE_OUT")
+            .unwrap_or_default()
+            .split(',')
+            .map(|h| h.trim().to_ascii_lowercase())
+            .filter(|h| h.len() == 16 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+            .collect()
+    });
+    !list.is_empty() && shaders.iter().any(|s| list.contains(&s.hash))
+}
+
+/// On Wave32 hosts (NVIDIA), `water_shading:CS_TransmissionVolumetrics_Tiled`
+/// (`5dc3b25986622949`) and `_Tiled_LocalLights` (`6f225b641c5b0708`) only
+/// translate in wave-wide form and leave dark tiles around boats/shores while
+/// costing ~15 ms/frame. Left out on 32-lane hosts unless `VICTORY_WATER_LIGHT=1`.
+#[cfg(windows)]
+fn water_light_left_out(shaders: &[Arc<Shader>]) -> bool {
+    const WATER_LIGHT: [&str; 2] = ["5dc3b25986622949", "6f225b641c5b0708"];
+    static ASKED: OnceLock<bool> = OnceLock::new();
+    !*ASKED.get_or_init(|| std::env::var_os("VICTORY_WATER_LIGHT").is_some_and(|v| v == "1"))
+        && victory_shader::emit::host_settings()[0] == 32
+        && shaders.iter().any(|s| WATER_LIGHT.contains(&s.hash.as_str()))
+}
+
 #[cfg(windows)]
 fn written_used(
     program: &victory_shader::NativeProgram,
@@ -681,7 +803,10 @@ fn hand_out(
 ) -> HRESULT {
     tracing::trace!(?shaders, "pipeline state");
     #[cfg(windows)]
-    let skipped = matches_skip(&shaders, skip_set()).is_some() || skip_raymarched_local_lights(&shaders);
+    let skipped = matches_skip(&shaders, skip_set()).is_some()
+        || skip_raymarched_local_lights(&shaders)
+        || leave_out_match(&shaders)
+        || water_light_left_out(&shaders);
     #[cfg(windows)]
     let host = Arc::new(make::Pending::new(shaders.clone(), graphics));
     #[cfg(windows)]
@@ -692,6 +817,8 @@ fn hand_out(
     }
     #[cfg(windows)]
     let builder = of_builder(&shaders);
+    #[cfg(windows)]
+    let ray_only = shaders_for_rays(&shaders);
     #[cfg(windows)]
     if builder {
         // Another stage: the group is looked at again at its next dispatch.
@@ -706,6 +833,8 @@ fn hand_out(
         host,
         #[cfg(windows)]
         builder,
+        #[cfg(windows)]
+        ray_only,
         #[cfg(windows)]
         skipped,
         shaders,
