@@ -669,7 +669,11 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     if n == 0 || n.checked_mul(PAGE).is_none() {
         return 0;
     }
-    let per = section_pages();
+    let per = if port_on() && n.saturating_mul(PAGE) <= (256 << 20) {
+        n
+    } else {
+        section_pages()
+    };
     let wine = on_wine();
     let mut sections = Vec::new();
     if sections.try_reserve_exact(n.div_ceil(per)).is_err() {

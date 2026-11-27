@@ -349,14 +349,17 @@ fn apply_runtime_defaults() {
     set_default("VICTORY_EARLY_TABLES", "1");
     set_default("VICTORY_NAN_SCRUB", "1");
     set_default("VICTORY_PIPELINE_WAIT_ONCE", "1");
+    // Cap per-frame wait for newly compiling pipelines (default 500 ms freezes
+    // opening cutscenes at ~3 FPS while shaders warm).
+    set_default("VICTORY_PIPELINE_WAIT_MS", "40");
     set_default("VICTORY_PORT_CONSTANTS", "1");
     set_default("VICTORY_PORT_CONSTANTS_ORDER", "1");
     set_default("VICTORY_FAIR_DUE", "1");
     // Visuals, lighting & non-black textures/skin: directional SH GI + keep-shown fallback.
-    set_default("VICTORY_AMBIENT", "1.1");
-    set_default("VICTORY_AMBIENT_AIR", "1.5");
-    set_default("VICTORY_AMBIENT_FLOOR", "0.22");
-    set_default("VICTORY_AMBIENT_DARK", "0.55");
+    set_default("VICTORY_AMBIENT", "0.7");
+    set_default("VICTORY_AMBIENT_AIR", "0.95");
+    set_default("VICTORY_AMBIENT_FLOOR", "0.14");
+    set_default("VICTORY_AMBIENT_DARK", "0.35");
     set_default("VICTORY_AMBIENT_MOST", "2");
     set_default("VICTORY_KEEP_SHOWN", "1");
     set_default("VICTORY_SHOW_AFTER", "1");
@@ -394,13 +397,16 @@ fn apply_runtime_defaults() {
     set_default("VICTORY_WINDOWS_BAR_MB", "1024");
     set_default("VICTORY_WINDOW_KB", "128");
     set_default("VICTORY_WINDOW_TAILS", "1");
+    // With renderer port 1 active (185 MiB 32-bit heap in place), keep hot
+    // buffers >= 64 KiB (up to 1280 MiB) in local VRAM so shaders avoid
+    // PCIe stalls (+50 ms GPU) and CPU snapshots/PC-copy landing (+16 ms).
     set_default("VICTORY_CARD_BUFFERS_MIN_KB", "64");
     set_default("VICTORY_CARD_BUFFERS_MB", "1280");
-    set_default("VICTORY_CARD_ROOM_FOR_TARGETS_MB", "1024");
-    set_default("VICTORY_TEXTURE_BUDGET_MB", "1024");
+    set_default("VICTORY_CARD_ROOM_FOR_TARGETS_MB", "768");
+    set_default("VICTORY_TEXTURE_BUDGET_MB", "2560");
     // Keep 4 KiB sub-64 KiB texture packing to avoid 3.3x VRAM bloat on 8 GB GPUs.
     set_default("VICTORY_POOL_SMALL", "1");
-    set_default("VICTORY_TEXTURE_ROOM_PERCENT", "80");
+    set_default("VICTORY_TEXTURE_ROOM_PERCENT", "88");
     set_default("VICTORY_TEXTURE_SHORT_HOLD", "1");
     set_default("VICTORY_TEXTURE_STAGE_MB", "96");
     set_default("VICTORY_TEXTURE_LOOK_MS", "400");
