@@ -633,7 +633,8 @@ unsafe fn piece_at(
     // stays; else it is opened once for the piece.
     let mut differing = [true; BLOCK / PAGE + 1];
     let base = title / PAGE;
-    if beside.is_none() {
+    let single_pass = beside.is_none() && !crate::watch::needs_landing_open(title, end);
+    if beside.is_none() && !single_pass {
         drop(reading);
         differing.fill(false);
         for_pages(title, parts, |from, n| {
@@ -651,11 +652,14 @@ unsafe fn piece_at(
         let opening = std::time::Instant::now();
         crate::watch::landing(from, to - from);
         spent(stat::NOTES, opening);
+    } else if beside.is_none() {
+        drop(reading);
     }
     let into = beside.unwrap_or(title);
     let since = crate::watch::changes();
     let (mut pages, mut new_pages, mut blocks, mut dwords, mut missing) = (0, 0u64, 0, 0, 0);
     let mut span: Option<(usize, usize)> = None;
+    let mut direct_span: Option<(usize, usize)> = None;
     for_pages(title, parts, |from, n| {
         pages += 1;
         if !differing[(title + from) / PAGE - base] {
@@ -696,9 +700,20 @@ unsafe fn piece_at(
                 }
                 let s = span.get_or_insert((title + from, title + from + n));
                 s.1 = title + from + n;
+            } else if single_pass {
+                let (lo, hi) = (title + from, title + from + n);
+                direct_span = Some(match direct_span {
+                    Some((cur_lo, cur_hi)) => (cur_lo.min(lo), cur_hi.max(hi)),
+                    None => (lo, hi),
+                });
             }
         }
     });
+    if let Some((from, to)) = direct_span {
+        let noting = std::time::Instant::now();
+        crate::watch::note_landed_only(from, to - from);
+        spent(stat::NOTES, noting);
+    }
     if let Some((from, to)) = span {
         notes.spans.push((from, to - from));
         // Not through a copy that is not to be noted, if that is asked: the

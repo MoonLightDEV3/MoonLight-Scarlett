@@ -2272,6 +2272,61 @@ fn trim_spare_chunks() {
     drop(shared_freed);
 }
 
+/// Contiguous FIFO ring allocator inside `CardWork::differs` (dwords).
+#[derive(Default)]
+struct CardRing {
+    head: u32,
+    used: u32,
+    in_flight: std::collections::VecDeque<u32>,
+}
+
+impl CardRing {
+    fn begin(&mut self, cap: u32, need: u32) -> (u32, u32, u32) {
+        if self.used == 0 {
+            self.head = 0;
+            return (0, cap, 0);
+        }
+        let tail = (self.head + self.used) % cap;
+        if self.head + self.used <= cap {
+            let tail_free = cap - (self.head + self.used);
+            if need > tail_free && self.head >= need {
+                (0, self.head, tail_free)
+            } else {
+                (tail, tail_free, 0)
+            }
+        } else {
+            (tail, self.head - tail, 0)
+        }
+    }
+
+    fn commit(&mut self, taken: u32, pad: u32) -> u32 {
+        let dwords = pad + taken;
+        self.used += dwords;
+        self.in_flight.push_back(dwords);
+        dwords
+    }
+
+    fn finish(&mut self, cap: u32) {
+        if let Some(dwords) = self.in_flight.pop_front() {
+            self.head = (self.head + dwords) % cap;
+            self.used = self.used.saturating_sub(dwords);
+            if self.used == 0 {
+                self.head = 0;
+            }
+        }
+    }
+
+    fn reset(&mut self) {
+        self.head = 0;
+        self.used = 0;
+        self.in_flight.clear();
+    }
+
+    fn low(&self, cap: u32) -> bool {
+        u64::from(self.used) * 2 > u64::from(cap)
+    }
+}
+
 /// What the host keeps for copies in the card's own memory
 /// ([`crate::shadow::cards`]): three lists of ours and the compare.
 struct CardWork {
@@ -2295,9 +2350,8 @@ struct CardWork {
     differs_gpu: ID3D12Resource,
     /// Where the pieces that differ are fetched to: PC memory, mapped.
     fetched: Option<(ID3D12Resource, usize, u64)>,
-    /// The dwords of `differs` taken by plans whose results were not read
-    /// yet.
-    taken: u32,
+    /// Ring-buffer allocation of dwords in `differs` across in-flight plans.
+    ring: CardRing,
     /// Plans made and not done with (`Host::card_done`).
     out: u32,
 }
@@ -2502,6 +2556,8 @@ impl CardPlan {
 /// What a submission does for copies in the card's memory.
 struct CardPlan {
     ranges: Vec<CardRange>,
+    /// The sync list (CPU-to-card updates), prepended to the submission's `ExecuteCommandLists`.
+    sync: Option<ID3D12CommandList>,
     /// The compare, run after the submission's lists.
     check: Option<ID3D12CommandList>,
     /// The copies whose card side was brought up to date, alive until the
@@ -2858,6 +2914,7 @@ fn landable(line: &[Option<u64>], completed: u64) -> usize {
 /// 64 KiB piece; the compare hashes the whole piece for each and stores
 /// the hash, so the second of them may find it stored already and not
 /// flag it.
+#[cfg(test)]
 fn flagged_pieces(flags: &[(usize, u32, bool)]) -> Vec<(usize, u32)> {
     let mut pieces: Vec<(usize, u32)> = flags.iter().filter(|f| f.2).map(|f| (f.0, f.1)).collect();
     pieces.sort_unstable();
@@ -3622,6 +3679,10 @@ fn late_helper() {
         let Some(target) = target else {
             let mut helping = crate::timeline::span("helper: landed lists reset and given back");
             land();
+            let finished = FINISHED.load(Ordering::Acquire);
+            if finished > 0 {
+                bury(finished);
+            }
             helping.next("helper: looking at what queues hold");
             crate::queue::release_held(false);
             continue;
@@ -3646,6 +3707,10 @@ fn late_helper() {
             host.settle(&mut submitted, WHY_CARD_DONE);
         }
         land();
+        let finished = FINISHED.load(Ordering::Acquire);
+        if finished > 0 {
+            bury(finished);
+        }
         crate::queue::release_held(false);
     }
 }
@@ -4599,7 +4664,7 @@ impl Host {
                 differs: (differs, data as usize, RESULTS),
                 differs_gpu,
                 fetched: None,
-                taken: 0,
+                ring: CardRing::default(),
                 out: 0,
             })
         }
@@ -4617,10 +4682,15 @@ impl Host {
     /// `relay`).
     /// `picked`: ranges that may be written too, and ranges to look at
     /// (`crate::picked`).
-    fn card_before(&self, declared: &[Declared], picked: &crate::picked::Ranges, flown: bool) -> Option<CardPlan> {
+    fn card_before(
+        &self,
+        declared: &[Declared],
+        picked: &crate::picked::Ranges,
+        flown: bool,
+    ) -> (Option<CardPlan>, Option<std::sync::MutexGuard<'static, u64>>) {
         use std::sync::Arc;
         if !crate::shadow::cards() {
-            return None;
+            return (None, None);
         }
         // The ranges this submission's shaders may write, per copy.
         let declared: Vec<Declared> = declared.iter().filter(|(shadow, _)| shadow.carded()).cloned().collect();
@@ -4642,10 +4712,12 @@ impl Host {
         let mut dirty = crate::shadow::card_dirty(sent_as);
         gathering.end();
         if declared.is_empty() && dirty.is_empty() && looked.is_empty() {
-            return None;
+            return (None, None);
         }
         let mut work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
-        let work = work.as_mut()?;
+        let Some(work) = work.as_mut() else {
+            return (None, None);
+        };
         // A copy whose shader writes are declared for the first time gets
         // its bytes from before, whole.
         let mut whole: Vec<Arc<crate::shadow::Shadow>> = Vec::new();
@@ -4662,6 +4734,7 @@ impl Host {
             }
         }
         let mut used: Vec<(bool, Prelude)> = Vec::new();
+        let mut sync_cmd: Option<ID3D12CommandList> = None;
         let mut looks = None;
         let mut up = None;
         // The bytes as they are now, whatever later submissions put there.
@@ -4678,7 +4751,7 @@ impl Host {
             // submission that was waited for, and came back after that);
             // live buffers, and the ranges lie in them.
             let recorded = unsafe {
-                (|| -> windows::core::Result<()> {
+                (|| -> windows::core::Result<ID3D12CommandList> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
                     if upcheck::on() {
@@ -4786,18 +4859,18 @@ impl Host {
                         }
                     }
                     list.Close()?;
-                    self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
-                    Ok(())
+                    list.cast()
                 })()
             };
-            if let Err(e) = recorded {
-                fail(format_args!("host copies in the card's memory could not be brought up to date ({e})"));
+            match recorded {
+                Ok(cmd) => sync_cmd = Some(cmd),
+                Err(e) => fail(format_args!("host copies in the card's memory could not be brought up to date ({e})")),
             }
             used.push((false, sync));
         }
-        drop(order);
         let mut plan = CardPlan {
             ranges: Vec::new(),
+            sync: sync_cmd,
             check: None,
             _synced: dirty.into_iter().map(|(shadow, _)| shadow).collect(),
             lists: used,
@@ -4806,9 +4879,10 @@ impl Host {
             sends: own.map(send::Own::memory),
             up,
         };
-        // Each byte once, as the copy-back joins the declared ranges. The
-        // results go behind those of plans still in the air.
-        let mut at = work.taken;
+        // Each byte once, as the copy-back joins the declared ranges. Reserve a
+        // contiguous ring slice inside `work.differs` ahead of in-flight plans.
+        let mut candidates: Vec<(Arc<crate::shadow::Shadow>, (usize, usize), crate::shadow::CardSpan, bool, bool)> = Vec::new();
+        let mut need = 0u32;
         for (shadow, ranges) in &declared {
             let mut sorted = ranges.clone();
             sorted.sort_unstable();
@@ -4824,41 +4898,44 @@ impl Host {
                 let Some(span) = shadow.card_span(from, to) else {
                     continue;
                 };
-                let compared = twin && u64::from(at + span.pieces) * 4 <= work.differs.2;
-                plan.ranges.push(CardRange {
-                    shadow: shadow.clone(),
-                    declared: (from, to),
-                    span,
-                    at,
-                    compared,
-                    picked: false,
-                });
-                if compared {
-                    at += span.pieces;
+                if twin {
+                    need = need.saturating_add(span.pieces);
                 }
+                candidates.push((shadow.clone(), (from, to), span, twin, false));
             }
         }
         for (shadow, from, len) in looked {
             let twin = shadow.card_sides().is_some_and(|(_, before, _)| before.is_some());
             if let Some(span) = shadow.card_span(*from, from + len)
                 && twin
-                && u64::from(at + span.pieces) * 4 <= work.differs.2
             {
-                plan.ranges.push(CardRange {
-                    shadow: shadow.clone(),
-                    declared: (*from, from + len),
-                    span,
-                    at,
-                    compared: true,
-                    picked: true,
-                });
-                at += span.pieces;
+                need = need.saturating_add(span.pieces);
+                candidates.push((shadow.clone(), (*from, from + len), span, true, true));
             }
         }
-        work.taken = at;
+        let cap = (work.differs.2 / 4) as u32;
+        let (start_at, avail, pad) = work.ring.begin(cap, need);
+        let mut at = start_at;
+        let mut taken_plan = 0u32;
+        for (shadow, declared, span, twin, picked) in candidates {
+            let compared = twin && taken_plan + span.pieces <= avail;
+            plan.ranges.push(CardRange {
+                shadow,
+                declared,
+                span,
+                at,
+                compared,
+                picked,
+            });
+            if compared {
+                at += span.pieces;
+                taken_plan += span.pieces;
+            }
+        }
+        work.ring.commit(taken_plan, pad);
         if plan.ranges.iter().any(|r| r.compared) {
-            let from = plan.ranges.iter().filter(|r| r.compared).map(|r| r.at).min().unwrap_or(0);
-            let end = work.taken;
+            let from = start_at;
+            let end = at;
             let Some(check) = work.check.pop().or_else(|| self.make_prelude()) else {
                 fail(format_args!("no host list for the compare of host copies in the card's memory"));
             };
@@ -4956,24 +5033,21 @@ impl Host {
             plan.lists.push((true, check));
         }
         work.out += 1;
-        Some(plan)
+        (Some(plan), order)
     }
 
-    /// With [`relay`]: whether the compare's result area is half taken by
-    /// plans in the air. It starts from the beginning only when no plan is
-    /// out, so the caller lets the flights land first.
+    /// With [`relay`]: whether the compare's result area is more than half taken
+    /// by plans in the air.
     fn card_results_low(&self) -> bool {
         CARD_WORK
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
-            .is_some_and(|work| u64::from(work.taken) * 8 > work.differs.2)
+            .is_some_and(|work| work.ring.low((work.differs.2 / 4) as u32))
     }
 
     /// The plan's submission has run and its results were read
-    /// ([`Host::card_back`]): its lists are free for the next plan. Called
-    /// when nothing of ours is on the card, so the compare's results start
-    /// from the beginning again.
+    /// ([`Host::card_back`]): its lists are free for the next plan.
     fn card_done(&self, plan: CardPlan) {
         if let Some(looks) = plan.looks {
             looks.read();
@@ -4991,11 +5065,11 @@ impl Host {
         for (check, list) in plan.lists {
             if check { work.check.push(list) } else { work.sync.push(list) }
         }
+        let cap = (work.differs.2 / 4) as u32;
+        work.ring.finish(cap);
         work.out = work.out.saturating_sub(1);
-        // With the relay other plans may be on the card, their results
-        // not read yet: the area starts again only when none is out.
         if !relay() || work.out == 0 {
-            work.taken = 0;
+            work.ring.reset();
         }
     }
 
@@ -5073,28 +5147,27 @@ impl Host {
             // Pieces caught while a later flight was at them (`torn`).
             let suspects = fetch.as_ref().map(|f| &f.suspects);
             let mut seen = std::collections::HashSet::new();
+            let mut flagged_set = std::collections::HashSet::<(usize, u32)>::new();
             for &(plan, behind) in plans {
                 plan.picked_found(differs);
-                let flags: Vec<(usize, u32, bool)> = plan
-                    .ranges
-                    .iter()
-                    .filter(|r| !r.picked)
-                    .flat_map(|r| {
-                        (0..r.span.pieces).map(move |p| {
-                            let flagged = !r.compared || differs.get((r.at + p) as usize).is_none_or(|&d| torn::flagged(d));
-                            let wanted = suspects.map_or(flagged, |s| s.wanted((r.shadow.id(), r.span.first + p), flagged));
-                            (std::sync::Arc::as_ptr(&r.shadow) as usize, r.span.first + p, wanted)
-                        })
-                    })
-                    .collect();
-                let fetched = flagged_pieces(&flags);
+                flagged_set.clear();
+                for r in plan.ranges.iter().filter(|r| !r.picked) {
+                    let copy = std::sync::Arc::as_ptr(&r.shadow) as usize;
+                    for p in 0..r.span.pieces {
+                        let flagged = !r.compared || differs.get((r.at + p) as usize).is_none_or(|&d| torn::flagged(d));
+                        let wanted = suspects.map_or(flagged, |s| s.wanted((r.shadow.id(), r.span.first + p), flagged));
+                        if wanted {
+                            flagged_set.insert((copy, r.span.first + p));
+                        }
+                    }
+                }
                 for r in plan.ranges.iter().filter(|r| !r.picked) {
                     let copy = std::sync::Arc::as_ptr(&r.shadow) as usize;
                     if upcheck::on() {
                         upcheck::declared(r.shadow.id(), r.span.from as usize, r.span.to as usize);
                     }
                     for p in 0..r.span.pieces {
-                        if fetched.binary_search(&(copy, r.span.first + p)).is_err() {
+                        if !flagged_set.contains(&(copy, r.span.first + p)) {
                             continue;
                         }
                         let (lo, hi) = r.shadow.card_piece(&r.span, p);
@@ -5400,7 +5473,6 @@ impl Host {
         }
         if last > 0 {
             FINISHED.store(last, Ordering::Release);
-            bury(last);
         }
         stage.next("landing: the rest");
         self.log_messages();
@@ -6142,11 +6214,20 @@ impl Host {
             shadow.writing(*at, *len);
         }
         let declared = declared_writes(runs);
-        let card = self.card_before(&declared, &picked, flown);
+        let (card, card_order) = self.card_before(&declared, &picked, flown);
         // The sends are taken: from here on the references hold what the
         // copies in the lists put.
         for (shadow, at, bytes) in batch.placed.drain(..) {
             shadow.placed_copy(at, &bytes);
+        }
+        if let Some(sync) = card.as_ref().and_then(|c| c.sync.clone()) {
+            lists.insert(0, Some(sync));
+            #[cfg(feature = "diagnostics")]
+            {
+                marks.iter_mut().for_each(|m| m.0 += 1);
+                marks.insert(0, (0, crate::copystat::Timed::Other));
+            }
+            firsts.iter_mut().for_each(|first| *first += 1);
         }
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
             #[cfg(feature = "diagnostics")]
@@ -6206,6 +6287,7 @@ impl Host {
                     self.queue.ExecuteCommandLists(&lists[from..to]);
                     from = to;
                 }
+                drop(card_order);
                 self.queue.Signal(&self.fence, *submitted)
             };
             awake::sent(&self.device);
@@ -6316,6 +6398,7 @@ impl Host {
             }
             let _ = (_i, started);
         }
+        drop(card_order);
         let _ = &firsts;
         FINISHED.store(this_submission, Ordering::Release);
         bury(this_submission);
@@ -11981,6 +12064,31 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!(ram_idle_ms(Some(0)), 2_000);
         // Missing falls back to normal
         assert_eq!(ram_idle_ms(None), 10_000);
+    }
+
+    #[test]
+    fn card_ring_wraps_and_drains_cleanly() {
+        let mut ring = super::CardRing::default();
+        let cap = 16;
+        assert_eq!(ring.begin(cap, 6), (0, 16, 0));
+        assert_eq!(ring.commit(6, 0), 6);
+        assert_eq!(ring.begin(cap, 6), (6, 10, 0));
+        assert_eq!(ring.commit(6, 0), 6);
+        assert!(ring.low(cap));
+        // Head moves to 6 after first finishes; 4 free at tail, 6 free at head -> wraps to 0 with pad=4.
+        ring.finish(cap);
+        assert!(!ring.low(cap));
+        assert_eq!(ring.begin(cap, 5), (0, 6, 4));
+        assert_eq!(ring.commit(5, 4), 9);
+        assert!(ring.low(cap));
+        // Finish remaining two; ring resets head to 0 when empty.
+        ring.finish(cap);
+        ring.finish(cap);
+        assert!(!ring.low(cap));
+        assert_eq!(ring.begin(cap, 16), (0, 16, 0));
+        ring.commit(4, 0);
+        ring.reset();
+        assert_eq!(ring.begin(cap, 16), (0, 16, 0));
     }
 }
 

@@ -2695,6 +2695,39 @@ pub(crate) fn landing(at: usize, len: usize) {
     writing(at, len);
 }
 
+/// Whether landing shader writes in `[at, at + len)` needs write-watch guards
+/// opened beforehand (`!light()` or any `PROTECTED` block in range).
+pub(crate) fn needs_landing_open(at: usize, len: usize) -> bool {
+    let last = at.saturating_add(len).div_ceil(BLOCK);
+    !light() || PROTECTED.any(at / BLOCK, last)
+}
+
+/// Records landed shader writebacks in `[at, at + len)` without a redundant
+/// guard open when no protected block is present, falling back to `writing`
+/// if a guard appeared concurrently.
+pub(crate) fn note_landed_only(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    {
+        let frame = crate::frame::current();
+        let (first, last) = (at / KERNEL_PAGE, (at + len - 1) / KERNEL_PAGE);
+        (first..=last).for_each(|page| LANDED.note(page, frame));
+        for (block, others) in elsewhere(at, len) {
+            let block = block / KERNEL_PAGE;
+            let here = first.max(block)..=last.min(block + BLOCK / KERNEL_PAGE - 1);
+            for other in others {
+                here.clone().for_each(|page| LANDED.note(page - block + other / KERNEL_PAGE, frame));
+            }
+        }
+    }
+    if needs_landing_open(at, len) {
+        writing(at, len);
+    } else {
+        crate::descriptor::host::remapped(at, len);
+    }
+}
+
 
 /// What shaders wrote went into title memory through another view of the
 /// same pages (`crate::inplace::beside`): `pages` (of 4 KiB, by number)

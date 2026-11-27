@@ -125,7 +125,9 @@ struct Card {
     /// started, in the card's memory too: made when shader writes are
     /// first declared for the copy, and compared with the card's side, on
     /// the card, after each submission that declares some.
-    before: Mutex<Option<ID3D12Resource>>,
+    before: std::sync::OnceLock<ID3D12Resource>,
+    /// Serializes one-time creation of `before`.
+    before_lock: Mutex<()>,
     /// Offsets of the copy whose bytes changed on the CPU's side and have
     /// not gone to the card's side yet.
     dirty: Mutex<Vec<(usize, usize)>>,
@@ -136,6 +138,8 @@ struct Card {
     sent: Mutex<SentRuns>,
     /// Whether something was put into `dirty` since it was last taken.
     touched: std::sync::atomic::AtomicBool,
+    /// Weak back-pointer to the owning `Shadow`, registered when `Card` is published.
+    self_weak: std::sync::OnceLock<std::sync::Weak<Shadow>>,
     /// Per 4 KiB page bitset tracking whether title memory has been copied
     /// into `data` for `NOT_WATCHED` card buffers so unchanged pages can be skipped.
     unwatched_seen: Vec<AtomicU64>,
@@ -148,10 +152,12 @@ impl Card {
         let words = (size as usize).div_ceil(KERNEL_PAGE).div_ceil(64);
         Self {
             staging,
-            before: Mutex::default(),
+            before: std::sync::OnceLock::new(),
+            before_lock: Mutex::default(),
             dirty: Mutex::default(),
             sent: Mutex::default(),
             touched: Default::default(),
+            self_weak: std::sync::OnceLock::new(),
             unwatched_seen: (0..words).map(|_| AtomicU64::new(0)).collect(),
             size,
         }
@@ -351,6 +357,18 @@ pub(crate) fn card_room_kept() -> u64 {
 /// The copies in the card's memory.
 static CARDED: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
 
+/// Carded copies dirtied on the CPU since the last [`card_dirty`] drain.
+/// Lock ordering: always acquire `card.dirty` BEFORE `DIRTY_CARDED` (never reverse).
+static DIRTY_CARDED: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
+
+fn register_card(shadow: &Arc<Shadow>) {
+    if let Some(card) = &shadow.card {
+        let weak = Arc::downgrade(shadow);
+        let _ = card.self_weak.set(weak.clone());
+        CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(weak);
+    }
+}
+
 /// Since the last frame line: bytes copied to card sides and the ranges
 /// they were; pieces compared on the card, pieces fetched and their
 /// bytes; the waits for the card the fetches added and their microseconds.
@@ -371,7 +389,9 @@ pub(crate) fn card_stats() -> [u64; 10] {
     for (i, stat) in CARD_STATS.iter().enumerate() {
         out[i] = stat.swap(0, Ordering::Relaxed);
     }
-    out[7] = CARDED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|w| w.strong_count() > 0).count() as u64;
+    let mut carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
+    carded.retain(|w| w.strong_count() > 0);
+    out[7] = carded.len() as u64;
     out[8] = CARD_BYTES[0].load(Ordering::Relaxed)
         + WINDOW_CARD_BYTES.load(Ordering::Relaxed)
         + WINDOW_MAPPED_BYTES.load(Ordering::Relaxed);
@@ -660,33 +680,40 @@ impl SentRuns {
 /// ([`Shadow::card_merge_relay`]). Notes of sends that every fetch still to
 /// be merged came after are dropped.
 pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)> {
-    let mut out = Vec::new();
-    let mut carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
+    let candidates = {
+        let mut dirty_carded = DIRTY_CARDED.lock().unwrap_or_else(|e| e.into_inner());
+        if dirty_carded.is_empty() {
+            return Vec::new();
+        }
+        std::mem::take(&mut *dirty_carded)
+    };
+    let mut out = Vec::with_capacity(candidates.len());
     let fetched = RELAY_FETCHED.load(Ordering::Acquire);
-    carded.retain(|weak| {
+    for weak in candidates {
         let Some(shadow) = weak.upgrade() else {
-            return false;
+            continue;
         };
-        let ranges = shadow
-            .card
-            .as_ref()
-            .filter(|c| c.touched.swap(false, Ordering::AcqRel))
-            .map(|c| {
-                let mut dirty = c.dirty.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(card) = shadow.card.as_ref() else {
+            continue;
+        };
+        let ranges = {
+            let mut dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
+            if !card.touched.swap(false, Ordering::AcqRel) {
+                Vec::new()
+            } else {
                 let ranges = joined(std::mem::take(&mut *dirty));
                 if relay() {
-                    let mut sent = c.sent.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut sent = card.sent.lock().unwrap_or_else(|e| e.into_inner());
                     sent.forget(fetched);
                     sent.note_joined(sent_as, ranges.clone());
                 }
                 ranges
-            })
-            .unwrap_or_default();
+            }
+        };
         if !ranges.is_empty() {
             out.push((shadow, ranges));
         }
-        true
-    });
+    }
     out
 }
 
@@ -2724,7 +2751,7 @@ impl Drop for Shadow {
             } else {
                 CARD_BYTES[0].fetch_sub(card.size, Ordering::Relaxed);
             }
-            if card.before.get_mut().unwrap_or_else(|e| e.into_inner()).is_some() {
+            if card.before.get_mut().is_some() {
                 CARD_BYTES[1].fetch_sub(card_hash_bytes(card.size), Ordering::Relaxed);
             }
         }
@@ -4533,7 +4560,7 @@ impl Shadow {
             }
             return self.copy(from, to);
         };
-        let whole = !known && card.before.lock().unwrap_or_else(|e| e.into_inner()).is_none();
+        let whole = !known && card.before.get().is_none();
         let start = self.start as usize;
         TITLE.with_borrow_mut(|title| {
             title.resize(PAGE, 0);
@@ -4633,8 +4660,12 @@ impl Shadow {
                 _ => dirty.push((from, to)),
             }
         }
-        // (Under the lock: what takes the list sees it or finds it set.)
-        card.touched.store(true, Ordering::Release);
+        // (Under the lock: what takes the list sees it or clears `touched` under the same lock.)
+        if !card.touched.swap(true, Ordering::AcqRel)
+            && let Some(weak) = card.self_weak.get()
+        {
+            DIRTY_CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(weak.clone());
+        }
     }
 
     /// Whether shaders were ever declared to write it.
@@ -4691,10 +4722,9 @@ impl Shadow {
 
     /// Of a copy in the card's memory: the CPU's side (PC memory), the
     /// card side's bytes from before if made yet, and their size.
-    pub(crate) fn card_sides(&self) -> Option<(&ID3D12Resource, Option<ID3D12Resource>, u64)> {
+    pub(crate) fn card_sides(&self) -> Option<(&ID3D12Resource, Option<&ID3D12Resource>, u64)> {
         let card = self.card.as_ref()?;
-        let before = card.before.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        Some((&card.staging, before, card.size))
+        Some((&card.staging, card.before.get(), card.size))
     }
 
     /// Shader writes are declared for a copy in the card's memory: makes
@@ -4706,15 +4736,19 @@ impl Shadow {
         let Some(card) = &self.card else {
             return false;
         };
-        let mut before = card.before.lock().unwrap_or_else(|e| e.into_inner());
-        if before.is_some() {
+        if card.before.get().is_some() {
             return false;
         }
-        *before = make(card.size);
-        if before.is_some() {
-            CARD_BYTES[1].fetch_add(card_hash_bytes(card.size), Ordering::Relaxed);
+        let _guard = card.before_lock.lock().unwrap_or_else(|e| e.into_inner());
+        if card.before.get().is_some() {
+            return false;
         }
-        before.is_some()
+        let Some(created) = make(card.size) else {
+            return false;
+        };
+        CARD_BYTES[1].fetch_add(card_hash_bytes(card.size), Ordering::Relaxed);
+        let _ = card.before.set(created);
+        true
     }
 
     /// The declared range `[address, end)` as the compare on the card
@@ -4928,6 +4962,9 @@ impl Shadow {
             shadow.card = Some(Card::new(none(), len.next_multiple_of(PIECE as u64)));
         }
         let shadow = Arc::new(shadow);
+        if shadow.card.is_some() {
+            register_card(&shadow);
+        }
         std::mem::forget(shadow.clone());
         shadow
     }
@@ -5573,7 +5610,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         shadow.card = card;
         let shadow = Arc::new(shadow);
         if shadow.card.is_some() {
-            CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
+            register_card(&shadow);
         }
         entry.shadow = Some(shadow);
         BUFFERS_CHANGED.fetch_add(1, Ordering::SeqCst);
@@ -5785,7 +5822,7 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
     shadow.changes_only.store(true, Ordering::Relaxed);
     shadow.card = Some(Card::new(staging, len));
     let shadow = Arc::new(shadow);
-    CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
+    register_card(&shadow);
     Some(shadow)
 }
 
@@ -5895,7 +5932,7 @@ fn loose(address: u64, len_ask: u64, end: u64, unsized_ask: bool, any: bool) -> 
     shadow.card = card;
     let shadow = Arc::new(shadow);
     if shadow.card.is_some() {
-        CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
+        register_card(&shadow);
     }
     note(&shadow);
     map.insert((start, len), shadow.clone());
@@ -6159,6 +6196,35 @@ mod window_tests {
 
         super::BUFFERS_CHANGED.fetch_add(1, super::Ordering::SeqCst);
         assert!(super::found(0x7_0000_1000, 64, false).is_none());
+    }
+
+    #[test]
+    fn dirty_carded_tracks_only_dirty_and_concurrent_writes() {
+        let mut backing_a = vec![0u8; super::PIECE];
+        let mut backing_b = vec![0u8; super::PIECE];
+        let a = super::Shadow::unbacked(0x8_0000_0000, backing_a.as_mut_ptr(), super::PIECE as u64, true);
+        let b = super::Shadow::unbacked(0x8_0001_0000, backing_b.as_mut_ptr(), super::PIECE as u64, true);
+        let _ = super::card_dirty(0);
+
+        a.card_changed(0, 64);
+        let dirty = super::card_dirty(10);
+        assert_eq!(dirty.len(), 1);
+        assert!(std::sync::Arc::ptr_eq(&dirty[0].0, &a));
+        assert_eq!(dirty[0].1, vec![(0, 64)]);
+        assert!(super::card_dirty(11).is_empty());
+
+        b.card_changed(128, 256);
+        let dirty = super::card_dirty(12);
+        assert_eq!(dirty.len(), 1);
+        assert!(std::sync::Arc::ptr_eq(&dirty[0].0, &b));
+        assert_eq!(dirty[0].1, vec![(128, 256)]);
+
+        // Re-dirtying after drain must re-enqueue on `DIRTY_CARDED`.
+        a.card_changed(64, 128);
+        let dirty = super::card_dirty(13);
+        assert_eq!(dirty.len(), 1);
+        assert!(std::sync::Arc::ptr_eq(&dirty[0].0, &a));
+        assert_eq!(dirty[0].1, vec![(64, 128)]);
     }
 }
 

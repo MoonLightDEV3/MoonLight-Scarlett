@@ -468,3 +468,18 @@ fn what_landing_costs() {
         busy.store(false, Ordering::Relaxed);
     });
 }
+
+#[test]
+fn single_pass_piece_at_merges_and_records_landed() {
+    let mut title = vec![0x11u8; PAGE];
+    let now = vec![0x22u8; PAGE];
+    let mut held = vec![0x11u8; PAGE];
+    let at = title.as_mut_ptr() as usize;
+    assert!(!crate::watch::needs_landing_open(at, PAGE));
+    let mut notes = Notes::default();
+    // SAFETY: disjoint buffers of `PAGE` bytes; valid pointers for the test.
+    let written = unsafe { piece_at(at, now.as_ptr(), held.as_mut_ptr(), &[(0, PAGE)], false, &mut notes, false, std::ptr::null()) };
+    assert_eq!(written, PAGE as u64);
+    assert_eq!(title, now);
+    assert_eq!(held, now);
+}

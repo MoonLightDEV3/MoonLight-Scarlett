@@ -733,6 +733,23 @@ mod streamline_interpose {
     const PARAMETER: u32 = 6;
     const CREATE_UPSCALE: u64 = 0x1_0000;
     const DISPATCH_UPSCALE: u64 = 0x1_0001;
+    const QUERY_JITTER_PHASE_COUNT: u64 = 0x1_0004;
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct QueryJitterPhaseCount {
+        header: Header,
+        render_width: u32,
+        display_width: u32,
+        out_phase_count: *mut i32,
+    }
+
+    const _: () = assert!(size_of::<QueryJitterPhaseCount>() == 0x20);
+
+    fn fallback_jitter_phase_count(render_width: u32, display_width: u32) -> i32 {
+        let ratio = display_width as f32 / render_width.max(1) as f32;
+        ((8.0 * ratio * ratio).ceil() as i32).max(8)
+    }
 
     #[repr(C)]
     #[derive(Clone, Copy, Debug)]
@@ -979,7 +996,7 @@ mod streamline_interpose {
         let Some(query) = original(3) else {
             return PARAMETER;
         };
-        if !desc.is_null() {
+        let kind = if !desc.is_null() {
             // SAFETY: the title passes a description.
             let kind = unsafe { (*desc).kind };
             static SEEN: Mutex<Vec<u64>> = Mutex::new(Vec::new());
@@ -991,9 +1008,36 @@ mod streamline_interpose {
                     "FidelityFX: the title asks a query of this kind (answered by its own DLL)"
                 );
             }
-        }
+            Some(kind)
+        } else {
+            None
+        };
         // SAFETY: the title's own function, with its arguments.
-        unsafe { std::mem::transmute::<*const (), Call>(query)(context, desc) }
+        let code = unsafe { std::mem::transmute::<*const (), Call>(query)(context, desc) };
+        if streamline::upscaling() && kind == Some(QUERY_JITTER_PHASE_COUNT) {
+            // SAFETY: validated `kind == QUERY_JITTER_PHASE_COUNT` above.
+            let q = unsafe { &*desc.cast::<QueryJitterPhaseCount>() };
+            if !q.out_phase_count.is_null() {
+                // SAFETY: non-null output pointer provided by the title.
+                let cur = unsafe { *q.out_phase_count };
+                if code != OK || cur <= 0 {
+                    let count = fallback_jitter_phase_count(q.render_width, q.display_width);
+                    // SAFETY: non-null output pointer provided by the title.
+                    unsafe { *q.out_phase_count = count };
+                    once!(
+                        info,
+                        render_width = q.render_width,
+                        display_width = q.display_width,
+                        code,
+                        original_count = cur,
+                        fallback_count = count,
+                        "FidelityFX: guarded jitter phase count query for DLSS render scale"
+                    );
+                    return OK;
+                }
+            }
+        }
+        code
     }
 
     extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *mut Header) -> u32 {
@@ -1132,6 +1176,14 @@ mod streamline_interpose {
                     Resolution::Missing
                 }
             }
+        }
+
+        #[test]
+        fn jitter_phase_count_guard_values() {
+            assert_eq!(fallback_jitter_phase_count(960, 1920), 32);
+            assert_eq!(fallback_jitter_phase_count(1280, 1920), 18);
+            assert_eq!(fallback_jitter_phase_count(1920, 1920), 8);
+            assert_eq!(fallback_jitter_phase_count(0, 1920), 29491200);
         }
 
         #[test]

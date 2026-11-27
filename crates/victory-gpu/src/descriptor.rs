@@ -861,14 +861,24 @@ pub(crate) fn with_heap<T>(heap: usize, f: impl FnOnce(&Heap) -> T) -> Option<T>
 /// them ([`host::HostHeap::id`]): the title can release the heap a list's
 /// slots came from, and a later heap can be made at the same address before
 /// the list is reset.
+/// Batch-releases dynamic descriptor slot ranges grouped by host heap and id,
+/// taking `SHADER_HEAPS` once and locking each pool shard at most once.
 #[cfg(windows)]
-pub(crate) fn release_dynamic(heap: usize, id: u64, first: u32, n: u32) {
+pub(crate) fn release_dynamic_batch(entries: &[(usize, u64, u32, u32)]) {
+    if entries.is_empty() {
+        return;
+    }
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
-    if heaps.iter().any(|&(_, _, h)| h == heap)
-        // SAFETY: registered heaps are live (removed when dropped).
-        && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
-    {
-        host.release(id, first, n);
+    for (i, &(heap, id, _, _)) in entries.iter().enumerate() {
+        if entries[..i].iter().any(|&(h, eid, _, _)| h == heap && eid == id) {
+            continue;
+        }
+        if heaps.iter().any(|&(_, _, h)| h == heap)
+            // SAFETY: registered heaps are live (removed when dropped).
+            && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
+        {
+            host.release_entries(heap, id, &entries[i..]);
+        }
     }
 }
 

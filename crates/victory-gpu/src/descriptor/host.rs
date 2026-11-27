@@ -32,10 +32,11 @@ impl Slots {
         Slots(bits)
     }
 
-    fn put(&self, slot: u32) {
-        if let Some(bits) = self.0.get(slot as usize / 64) {
-            bits.fetch_or(1 << (slot % 64), std::sync::atomic::Ordering::AcqRel);
-        }
+    fn put(&self, slot: u32) -> bool {
+        let bit = 1 << (slot % 64);
+        self.0
+            .get(slot as usize / 64)
+            .is_some_and(|bits| bits.fetch_or(bit, std::sync::atomic::Ordering::AcqRel) & bit == 0)
     }
 
     /// Whether it was there.
@@ -372,19 +373,61 @@ impl Pools {
         None
     }
 
+    #[cfg(test)]
     fn give(&self, first: u32, n: u32) {
-        let start = first as usize;
-        let end = start.saturating_add(n as usize).min(self.total);
-        if start >= end {
+        self.give_batch(&[(first, n)]);
+    }
+
+    #[cfg(test)]
+    fn give_batch(&self, ranges: &[(u32, u32)]) {
+        if ranges.is_empty() {
             return;
         }
         let mut freed = 0u32;
         for s in 0..Self::SHARDS {
-            let lo = start.max(self.starts[s]);
-            let hi = end.min(self.ends[s]);
-            if lo < hi {
-                let mut pool = self.shards[s].lock().unwrap_or_else(|e| e.into_inner());
-                freed += pool.give(lo - self.starts[s], hi - lo);
+            let s_start = self.starts[s];
+            let s_end = self.ends[s];
+            let mut pool: Option<std::sync::MutexGuard<'_, Pool>> = None;
+            for &(first, n) in ranges {
+                let start = first as usize;
+                let end = start.saturating_add(n as usize).min(self.total);
+                let lo = start.max(s_start);
+                let hi = end.min(s_end);
+                if lo < hi {
+                    let guard = pool.get_or_insert_with(|| self.shards[s].lock().unwrap_or_else(|e| e.into_inner()));
+                    freed += guard.give(lo - s_start, hi - lo);
+                }
+            }
+        }
+        if freed > 0 {
+            self.free.fetch_add(freed, Relaxed);
+        }
+    }
+
+    fn give_entries(&self, heap: usize, id: u64, count: u32, entries: &[(usize, u64, u32, u32)]) {
+        if entries.is_empty() {
+            return;
+        }
+        let mut freed = 0u32;
+        for s in 0..Self::SHARDS {
+            let s_start = self.starts[s];
+            let s_end = self.ends[s];
+            let mut pool: Option<std::sync::MutexGuard<'_, Pool>> = None;
+            for &(entry_heap, entry_id, first, n) in entries {
+                if entry_heap != heap || entry_id != id {
+                    continue;
+                }
+                let Some(at) = first.checked_sub(count) else {
+                    continue;
+                };
+                let start = at as usize;
+                let end = start.saturating_add(n as usize).min(self.total);
+                let lo = start.max(s_start);
+                let hi = end.min(s_end);
+                if lo < hi {
+                    let guard = pool.get_or_insert_with(|| self.shards[s].lock().unwrap_or_else(|e| e.into_inner()));
+                    freed += guard.give(lo - s_start, hi - lo);
+                }
             }
         }
         if freed > 0 {
@@ -431,6 +474,10 @@ pub(crate) struct HostHeap {
     /// The same for a slot whose descriptor is made and stays (else 0): what
     /// [`HostHeap::mirror`] asks first, without the lock. Changed under it.
     quick: Vec<std::sync::atomic::AtomicU64>,
+    /// Compact tag of the last null descriptor written per title slot (`0`:
+    /// unknown or non-null view), so repeated `later && shown == 0` mirrors
+    /// skip rewriting the identical null descriptor (`null_kind_for`).
+    null_kind: Vec<std::sync::atomic::AtomicU8>,
     /// The records of the title's heap as the pass over records copied in
     /// as bytes last saw them ([`Copied::changes`]). Made on first
     /// use.
@@ -2071,6 +2118,9 @@ impl HostHeap {
                 .collect(),
             made: Made::new(count as usize),
             quick: (0..count).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
+            null_kind: (0..if sampler { 0 } else { count })
+                .map(|_| std::sync::atomic::AtomicU8::new(0))
+                .collect(),
             copied: Mutex::new(Vec::new()),
             waiting: Mutex::default(),
             away: Mutex::default(),
@@ -2665,6 +2715,7 @@ impl HostHeap {
                 note_before(index, shown, "neutral");
                 self.quick_is(index, 0);
                 self.made.set(index, 0);
+                self.set_null_kind(index, 0);
                 let kept = neutral_for(&view, self.at(index));
                 self.put(index);
                 self.clear_twin(index);
@@ -2781,6 +2832,7 @@ impl HostHeap {
                 let was = shown;
                 self.quick_is(f.index, 0);
                 self.made.set(f.index, f.key);
+                self.set_null_kind(f.index, 0);
                 self.keep(f.index, kept);
                 #[cfg(feature = "diagnostics")]
                 if f.late.is_some() && was != 0 {
@@ -2833,8 +2885,14 @@ impl HostHeap {
             return;
         }
         match view_at(key as u32, (key >> 32) as u32) {
-            Some(view) => null_for(&view, self.at(index)),
-            None => null_view(self.at(index)),
+            Some(view) => {
+                null_for(&view, self.at(index));
+                self.set_null_kind(index, null_kind_for(&view));
+            }
+            None => {
+                null_view(self.at(index));
+                self.set_null_kind(index, if self.sampler { 0 } else { 1 });
+            }
         }
         self.put(index);
         self.clear_twin(index);
@@ -3060,8 +3118,7 @@ impl HostHeap {
             write_view_address(*data, index, view);
         }
         let was = if stride.is_some() {
-            self.buffers.put(index);
-            true
+            self.buffers.put(index) || !seen
         } else {
             self.buffers.remove(index)
         };
@@ -3076,6 +3133,7 @@ impl HostHeap {
     /// heap they came from.
     ///
     /// [`dynamic`]: HostHeap::dynamic
+    #[cfg(test)]
     pub(crate) fn release(&self, id: u64, first: u32, n: u32) {
         if id != self.id {
             return;
@@ -3084,6 +3142,13 @@ impl HostHeap {
             return;
         };
         self.pools.give(at, n);
+    }
+
+    pub(crate) fn release_entries(&self, heap: usize, id: u64, entries: &[(usize, u64, u32, u32)]) {
+        if id != self.id {
+            return;
+        }
+        self.pools.give_entries(heap, id, self.count, entries);
     }
 
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
@@ -3166,6 +3231,7 @@ impl HostHeap {
             self.null_sampler(index);
         } else {
             null_view(self.at(index));
+            self.set_null_kind(index, 1);
             self.put(index);
         }
         self.clear_twin(index);
@@ -3685,6 +3751,7 @@ impl HostHeap {
                     note_before(index, shown, "neutral, new texture");
                     self.quick_is(index, 0);
                     self.made.set(index, 0);
+                    self.set_null_kind(index, 0);
                     let kept = neutral_for(&view, self.at(index));
                     self.put(index);
                     self.clear_twin(index);
@@ -3702,6 +3769,19 @@ impl HostHeap {
             if !self.sampler && is_texture_view(&view) {
                 note_before(index, shown, if later { "null, waits" } else { "at once" });
             }
+            if later && shown == 0 && !self.sampler {
+                let nkind = null_kind_for(&view);
+                if nkind != 0 && self.get_null_kind(index) == nkind {
+                    self.quick_is(index, 0);
+                    if self.twins.get(index as usize).is_some_and(|m| m.load(Relaxed)) {
+                        self.clear_twin(index);
+                    }
+                    self.keep_ref(index, None);
+                    drop(held);
+                    self.unmake_stale(index, stale);
+                    return Some(view);
+                }
+            }
             self.quick_is(index, 0);
             self.made.set(index, if later { 0 } else { key });
             let kept = if later {
@@ -3711,12 +3791,18 @@ impl HostHeap {
             };
             if kept.is_none() && !self.sampler {
                 null_for(&view, self.at(index));
+                self.set_null_kind(index, null_kind_for(&view));
+            } else if kept.is_some() {
+                self.set_null_kind(index, 0);
             }
             if kept.is_some() || !self.sampler {
                 self.put(index);
             }
             self.twin_made(index, kept.is_some() && twinned(&view));
-            self.keep(index, kept.flatten());
+            match kept.flatten() {
+                Some(r) => self.keep(index, Some(r)),
+                None => self.keep_ref(index, None),
+            }
             self.quick_is(index, if later { 0 } else { key });
             drop(held);
             self.unmake_stale(index, stale);
@@ -3735,6 +3821,16 @@ impl HostHeap {
     fn quick_is(&self, index: u32, key: u64) {
         if let Some(quick) = self.quick.get(index as usize) {
             quick.store(key, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    fn get_null_kind(&self, index: u32) -> u8 {
+        self.null_kind.get(index as usize).map_or(0, |k| k.load(Relaxed))
+    }
+
+    fn set_null_kind(&self, index: u32, kind: u8) {
+        if let Some(slot) = self.null_kind.get(index as usize) {
+            slot.store(kind, Relaxed);
         }
     }
 
@@ -4201,6 +4297,29 @@ pub(crate) static TWINS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync:
 /// no raw view. An AMD descriptor of a raw buffer is its address (48 bits),
 /// its bytes and flags; only one that says just that is changed, and only
 /// where what the handle points at is the descriptor. False: not moved.
+/// Whether `move_raw` has been observed to be unsupported on the current host driver
+/// (`0` = unknown, `1` = supported, `2` = unsupported).
+static MOVE_RAW_SUPPORTED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+fn move_raw_unsupported() -> bool {
+    MOVE_RAW_SUPPORTED.load(Relaxed) == 2
+}
+
+fn move_raw_twin(at: D3D12_CPU_DESCRIPTOR_HANDLE, start: u64, bytes: u32, by: u32) -> bool {
+    if !staged(false, 1).is_some_and(|s| s.ptr == at.ptr) {
+        return false;
+    }
+    if move_raw(at, start, bytes, by) {
+        MOVE_RAW_SUPPORTED.store(1, Relaxed);
+        true
+    } else {
+        if by < bytes && start >> 48 == 0 && MOVE_RAW_SUPPORTED.load(Relaxed) == 0 {
+            MOVE_RAW_SUPPORTED.store(2, Relaxed);
+        }
+        false
+    }
+}
+
 pub(crate) fn move_raw(at: D3D12_CPU_DESCRIPTOR_HANDLE, start: u64, bytes: u32, by: u32) -> bool {
     // (Off dwords too, as the typed view it stands for begins there: a view
     // of 16 bit values at an odd one.)
@@ -4331,23 +4450,42 @@ fn buffer_srv(
     };
     if let Some(twin) = twin {
         let window = twin_window(desc.Format, first, count, stride, raw, width);
-        if let Some((first, count, by)) = window {
-            desc.Format = DXGI_FORMAT_R32_TYPELESS;
-            desc.Anonymous.Buffer = D3D12_BUFFER_SRV {
-                FirstElement: first,
-                NumElements: count,
-                StructureByteStride: 0,
-                Flags: D3D12_BUFFER_SRV_FLAG_RAW,
-            };
-            // SAFETY: a live buffer and a slot of our heap.
-            let start = unsafe {
-                host.device
-                    .CreateShaderResourceView(&shadow.buffer, Some(&desc), twin);
-                shadow.buffer.GetGPUVirtualAddress() + first * 4
-            };
-            if by > 0 && !(staged(false, 1).is_some_and(|s| s.ptr == twin.ptr) && move_raw(twin, start, count.saturating_mul(4), by)) {
+        if let Some((twin_first, twin_count, by)) = window {
+            if by > 0 && move_raw_unsupported() {
                 TWINS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 null_buffer_view(twin);
+            } else if raw
+                && by == 0
+                && twin_first == first
+                && twin_count == count
+                && desc.Format == DXGI_FORMAT_R32_TYPELESS
+                && stride == 0
+                && staged(false, 0).is_some_and(|s| s.ptr == at.ptr)
+            {
+                // SAFETY: `at` is this thread's non-shader-visible staged CPU slot,
+                // holding the identical raw buffer SRV descriptor.
+                unsafe {
+                    host.device
+                        .CopyDescriptorsSimple(1, twin, at, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+                }
+            } else {
+                desc.Format = DXGI_FORMAT_R32_TYPELESS;
+                desc.Anonymous.Buffer = D3D12_BUFFER_SRV {
+                    FirstElement: twin_first,
+                    NumElements: twin_count,
+                    StructureByteStride: 0,
+                    Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                };
+                // SAFETY: a live buffer and a slot of our heap.
+                let start = unsafe {
+                    host.device
+                        .CreateShaderResourceView(&shadow.buffer, Some(&desc), twin);
+                    shadow.buffer.GetGPUVirtualAddress() + twin_first * 4
+                };
+                if by > 0 && !move_raw_twin(twin, start, twin_count.saturating_mul(4), by) {
+                    TWINS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    null_buffer_view(twin);
+                }
             }
         } else {
             null_buffer_view(twin);
@@ -4431,8 +4569,7 @@ fn buffer_uav(
         // refused by `buffer_view_ok` and left null, runs 15 and 16.)
         desc.Format = DXGI_FORMAT_R32_TYPELESS;
     }
-    // SAFETY: a live buffer.
-    let width = unsafe { shadow.buffer.GetDesc() }.Width;
+    let width = shadow.width();
     if !buffer_view_ok(desc.Format, first, count, stride, raw, width) {
         REFUSED_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         once!(
@@ -4454,24 +4591,43 @@ fn buffer_uav(
     };
     if let Some(twin) = twin {
         let window = twin_window(desc.Format, first, count, stride, raw, width);
-        if let Some((first, count, by)) = window {
-            desc.Format = DXGI_FORMAT_R32_TYPELESS;
-            desc.Anonymous.Buffer = D3D12_BUFFER_UAV {
-                FirstElement: first,
-                NumElements: count,
-                StructureByteStride: 0,
-                CounterOffsetInBytes: 0,
-                Flags: D3D12_BUFFER_UAV_FLAG_RAW,
-            };
-            // SAFETY: a live buffer and a slot of our heap.
-            let start = unsafe {
-                host.device
-                    .CreateUnorderedAccessView(&shadow.buffer, None::<&ID3D12Resource>, Some(&desc), twin);
-                shadow.buffer.GetGPUVirtualAddress() + first * 4
-            };
-            if by > 0 && !(staged(false, 1).is_some_and(|s| s.ptr == twin.ptr) && move_raw(twin, start, count.saturating_mul(4), by)) {
+        if let Some((twin_first, twin_count, by)) = window {
+            if by > 0 && move_raw_unsupported() {
                 TWINS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 null_buffer_view(twin);
+            } else if raw
+                && by == 0
+                && twin_first == first
+                && twin_count == count
+                && desc.Format == DXGI_FORMAT_R32_TYPELESS
+                && stride == 0
+                && staged(false, 0).is_some_and(|s| s.ptr == at.ptr)
+            {
+                // SAFETY: `at` is this thread's non-shader-visible staged CPU slot,
+                // holding the identical raw buffer UAV descriptor.
+                unsafe {
+                    host.device
+                        .CopyDescriptorsSimple(1, twin, at, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+                }
+            } else {
+                desc.Format = DXGI_FORMAT_R32_TYPELESS;
+                desc.Anonymous.Buffer = D3D12_BUFFER_UAV {
+                    FirstElement: twin_first,
+                    NumElements: twin_count,
+                    StructureByteStride: 0,
+                    CounterOffsetInBytes: 0,
+                    Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                };
+                // SAFETY: a live buffer and a slot of our heap.
+                let start = unsafe {
+                    host.device
+                        .CreateUnorderedAccessView(&shadow.buffer, None::<&ID3D12Resource>, Some(&desc), twin);
+                    shadow.buffer.GetGPUVirtualAddress() + twin_first * 4
+                };
+                if by > 0 && !move_raw_twin(twin, start, twin_count.saturating_mul(4), by) {
+                    TWINS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    null_buffer_view(twin);
+                }
             }
         } else {
             null_buffer_view(twin);
@@ -5309,6 +5465,38 @@ pub(crate) fn placed_texture(view: &View) -> Option<View> {
     Some(View::Shader(texture as usize, desc[..10].try_into().ok()))
 }
 
+/// Compact tag matching the exact null descriptor variant written by [`null_for`].
+fn null_kind_for(view: &View) -> u8 {
+    let is_buffer = |r: &usize| crate::resource::buffer_bytes(*r as crate::object::This).is_some();
+    let (buffer, dimension) = match view {
+        View::Unordered(r, _, desc) => (
+            is_buffer(r) || desc.is_some_and(|d| d[1] == 1),
+            desc.map(|d| d[1]),
+        ),
+        View::Placed(true, resource, desc) => (resource[0] == 1, Some(desc[1])),
+        View::Shader(r, desc) if is_buffer(r) || desc.is_some_and(|d| d[1] == 1) => return 2,
+        View::Placed(false, resource, _) if resource[0] == 1 => return 2,
+        View::Shader(_, Some(desc)) => {
+            return if (2..=10).contains(&desc[1]) { 16 + desc[1] as u8 } else { 1 };
+        }
+        View::Placed(false, _, desc) => {
+            return if (2..=10).contains(&desc[1]) { 16 + desc[1] as u8 } else { 1 };
+        }
+        View::Constant(..) => return 3,
+        _ => return 1,
+    };
+    if buffer {
+        return 4;
+    }
+    match dimension.map(|d| D3D12_UAV_DIMENSION(d as i32)) {
+        Some(D3D12_UAV_DIMENSION_TEXTURE1D) => 6,
+        Some(D3D12_UAV_DIMENSION_TEXTURE1DARRAY) => 7,
+        Some(D3D12_UAV_DIMENSION_TEXTURE2DARRAY) => 8,
+        Some(D3D12_UAV_DIMENSION_TEXTURE3D) => 9,
+        _ => 5,
+    }
+}
+
 /// A null view of the kind `view` is, for a slot whose view the host
 /// cannot make: unordered access (to a buffer or a 2D texture) or a shader
 /// view. Writes to it are dropped, reads give zeros.
@@ -5510,6 +5698,17 @@ mod tests {
                 });
             }
         });
+        assert_eq!(pools.free.load(Relaxed), 64);
+        assert_eq!(pools.take(64), Some(0));
+        pools.give(0, 64);
+        assert_eq!(pools.free.load(Relaxed), 64);
+
+        // Batch release coalesces across shard boundaries with one lock per shard.
+        let wide = pools.take(20).unwrap();
+        let a = pools.take(4).unwrap();
+        let b = pools.take(4).unwrap();
+        assert_eq!(pools.free.load(Relaxed), 36);
+        pools.give_batch(&[(wide, 20), (a, 4), (b, 4)]);
         assert_eq!(pools.free.load(Relaxed), 64);
         assert_eq!(pools.take(64), Some(0));
         pools.give(0, 64);
@@ -6624,9 +6823,13 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
     #[test]
     fn a_set_of_slots_holds_what_was_put_in() {
         let set = Slots::new(200);
-        for slot in [199, 0, 64, 63, 130, 64] {
-            set.put(slot);
-        }
+        assert!(set.put(199));
+        assert!(set.put(0));
+        assert!(set.put(64));
+        assert!(!set.put(64), "duplicate put must return false");
+        assert!(set.put(63));
+        assert!(set.put(130));
+        assert!(!set.put(130), "duplicate put must return false");
         assert_eq!(set.all(u64::MAX), [0, 63, 64, 130, 199]);
         assert_eq!(set.part::<2>(0), [0, 64, 130]);
         assert!(set.remove(64) && !set.remove(64) && !set.remove(5));
